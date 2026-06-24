@@ -1,0 +1,12 @@
+{
+    "display_name": "Визуальная новелла (VN)",
+    "loading_order": 101,
+    "requires": [],
+    "optional": ["sillyimages"],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "local",
+    "version": "1.1.0",
+    "homePage": "",
+    "auto_update": false
+}
