@@ -1,0 +1,26 @@
+# --- референсы / черновики (не для публикации) ---
+_ref/
+*.zip
+*.bak
+*.tmp
+*.orig
+
+# --- ОС ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- редакторы / IDE ---
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- инструменты Claude / заметки ---
+.claude/
+CLAUDE.md
+
+# --- node (если вдруг заведёшь сборку/линтер) ---
+node_modules/
+npm-debug.log*
+package-lock.json

@@ -47,6 +47,7 @@
         injectPrompt: true,    // инжектить наш VN-промпт (выключи, если используешь свой промпт картинок)
         detectAnyImages: true, // распознавать картинки в ЛЮБОЙ обёртке (<illust>/<image_lite>/<div>), не только <vn>
         extBlocksImages: true, // подхватывать картинки из блоков ExtBlocks (message.extra.extblocks) — как «Process external blocks» у sillyimages
+        seqImages: true,       // генерировать кадры ПО ОДНОМУ (следующий стартует, когда предыдущий готов) — для API, где нельзя параллельно
         imageSize: '1K',       // качество кадров (image_size): '1K' | '2K' | '4K'; 2K/4K жёстко прописываются в тег
         imgFormat: 'iig',      // какой тег картинок наш промпт велит ИИ эмитить: 'iig' (sillyimages) | 'image' (<image>) | 'other' (своё расширение)
         imgDetect: '',         // свой regex распознавания картинок (перебивает дефолтный союз)
@@ -1717,6 +1718,14 @@ ${roster}
         const note = ov.querySelector('#svn-bg-note'); if (!note) return;
         let st = currentFrameImageState();
         if (st === 'generating') {
+            const qf = player.scene && player.scene.frames[player.frame];
+            if (qf && frameQueued(player.mesId, qf.imageIndex)) { // ждёт своей очереди — не «зависание»
+                player.genFrame = -1; player.genSince = 0;
+                note.classList.remove('svn-note-fail');
+                note.innerHTML = `<span class="svn-spin"></span><span>кадр в очереди…</span>`;
+                note.classList.add('svn-show');
+                return;
+            }
             if (player.genFrame !== player.frame) { player.genFrame = player.frame; player.genSince = Date.now(); }
             if (Date.now() - (player.genSince || 0) > SVN_GEN_STUCK_MS) st = 'stuck';
         } else { player.genFrame = -1; player.genSince = 0; }
@@ -2672,6 +2681,18 @@ ${roster}
         if (!f || f.imageIndex < 0) { toastr && toastr.info('У этого кадра нет картинки', 'Визуальная новелла'); return; }
         const mes = getMesEl(player.mesId); if (!mes) return;
         const k = f.imageIndex;
+        // кадр лежит в очереди (например, чат перезагрузили посреди серии) — сразу пускаем его в работу
+        if (frameQueued(player.mesId, k)) {
+            const msg = (getCtx().chat || [])[player.mesId];
+            if (msg && seqSetTag(msg, k, SEQ_WAIT, '[IMG:GEN]')) {
+                try { getCtx().updateMessageBlock && getCtx().updateMessageBlock(player.mesId, msg); } catch (e) { /* ignore */ }
+                try { getCtx().saveChat && getCtx().saveChat(); } catch (e) { /* ignore */ }
+                retriggerImageExtension(player.mesId, { noButton: true });
+                toastr && toastr.info('Кадр запущен', 'Визуальная новелла');
+                scheduleCardRefresh(player.mesId);
+                return;
+            }
+        }
         // 1) sillyimages 1.x: кнопка с data-tag-index
         let btn = mes.querySelector(`.iig-regen-single-btn[data-tag-index="${k}"]`);
         // 2) megarakk / sillyimages 2.0: угловая кнопка .iig-img-regen у K-й картинки
@@ -2896,6 +2917,7 @@ ${roster}
         <label class="checkbox_label"><input type="checkbox" id="svn_director" ${s.autoDirector !== false ? 'checked' : ''}><span>Мини-ИИ сам ставит кадры (надёжно) <small style="opacity:.6;">— читает готовый ответ и ставит ровно столько кадров, сколько задано ниже. Число соблюдается точно.</small></span></label>
         <div class="flex-row"><label for="svn_minimg">Кадров (картинок) на ответ</label><span class="svn-cfg-range">от <input type="number" id="svn_minimg" class="text_pole" min="1" max="10" value="${Math.max(1, Math.min(parseInt(s.maxImages, 10) || 5, parseInt(s.minImages, 10) || 2))}"> до <input type="number" id="svn_maximg" class="text_pole" min="1" max="10" value="${s.maxImages}"></span></div>
         <small class="svn-cfg-note">Сколько кадров в ответе. С «мини-ИИ сам ставит кадры» соблюдается точно. Для фиксированного числа — «от» и «до» одинаковыми.</small>
+        <label class="checkbox_label"><input type="checkbox" id="svn_seq" ${s.seqImages !== false ? 'checked' : ''}><span>Генерировать кадры по одному <small style="opacity:.6;">— следующий кадр стартует, когда предыдущий готов. Включи, если API не умеет в параллель (иначе часть кадров падает в ретрай)</small></span></label>
         <label class="checkbox_label"><input type="checkbox" id="svn_landscape" ${s.forceLandscape ? 'checked' : ''}><span>Только горизонтальные кадры 16:9 <small style="opacity:.6;">— жёстко правит aspect_ratio, лучше для ПК</small></span></label>
         <div class="flex-row"><label for="svn_imgsize">Качество кадров</label><select id="svn_imgsize" class="text_pole" style="width:auto;">
           <option value="1K"${(s.imageSize || '1K') === '1K' ? ' selected' : ''}>1K (быстро)</option>
@@ -3018,6 +3040,7 @@ ${roster}
             s.minImages = v; saveSettings(); updateInjection();
         });
         bind('#svn_director', 'change', e => { s.autoDirector = e.target.checked; saveSettings(); updateInjection(); syncImgHint(); toastr && toastr.info(e.target.checked ? 'Мини-ИИ сам ставит кадры — основному ИИ инструкций про картинки не уходит' : 'Кадры ставит основной ИИ по инструкции в промпте', 'Визуальная новелла'); });
+        bind('#svn_seq', 'change', e => { s.seqImages = e.target.checked; saveSettings(); if (!e.target.checked) seqReleaseAll(); });
         bind('#svn_landscape', 'change', e => { s.forceLandscape = e.target.checked; saveSettings(); updateInjection(); });
         bind('#svn_imgsize', 'change', e => { s.imageSize = e.target.value; saveSettings(); updateInjection(); });
         bind('#svn_detectany', 'change', e => { s.detectAnyImages = e.target.checked; saveSettings(); decorateAll(); });
@@ -3630,7 +3653,7 @@ ${fields.join('\n')}
     }
     // собрать тег картинки в выбранном формате (iig / <image>) с учётом 16:9 и качества.
     // data-svn="1" — метка «это кадр от режиссёра» (чтобы чистить свои картинки во внешних блоках, не трогая чужие)
-    function buildImageTag(prompt, idx) {
+    function buildImageTag(prompt, idx, hold) {
         const s = getSettings();
         const p = String(prompt || '').replace(/\s+/g, ' ').trim() || 'cinematic anime illustration of the current scene';
         if ((s.imgFormat || 'iig') === 'image') return `<image>${p.replace(/<\/?image>/gi, '')}</image>`;
@@ -3639,11 +3662,13 @@ ${fields.join('\n')}
         const instr = JSON.stringify({ prompt: p, aspect_ratio: land ? '16:9' : '3:2', image_size: size }).replace(/'/g, '&#39;');
         // data-svn=индекс кадра — уникальная метка: расширение картинок меняет src по точному совпадению
         // строки тега, и два ОДИНАКОВЫХ промпта без уникальной метки слились бы в один (часть кадров не появлялась бы)
-        return `<img data-svn="${idx != null ? idx : 0}" data-iig-instruction='${instr}' src="[IMG:GEN]">`;
+        // hold=true → кадр «в очереди»: src=[IMG:WAIT], расширение картинок его не трогает, пока очередь не сменит на [IMG:GEN]
+        return `<img data-svn="${idx != null ? idx : 0}" data-iig-instruction='${instr}' src="${hold ? SEQ_WAIT : '[IMG:GEN]'}">`;
     }
     // режим внешних блоков для картинок режиссёра: теги уходят в extra.extblocks, в .mes — плейсхолдеры.
     // только для формата iig (его читает/пишет расширение картинок в extblocks); 'image' остаётся inline.
     const IMG_PLACEHOLDER = '<!--svn-img-->';
+    const SEQ_WAIT = '[IMG:WAIT]'; // маркер «кадр в очереди на генерацию» (см. блок ПОСЛЕДОВАТЕЛЬНАЯ ГЕНЕРАЦИЯ КАДРОВ)
     function directorToBlocks() {
         const s = getSettings();
         return s.extBlocksImages !== false && (s.imgFormat || 'iig') === 'iig';
@@ -3828,7 +3853,8 @@ ${prose}
                 head += `<sprite name="${escapeHtml(sp.name)}" pos="${pos}"${emo ? ` emotion="${escapeHtml(emo)}"` : ''}>\n`;
             }
         }
-        const tags = prompts.map((p, i) => buildImageTag(p, i));
+        const seq = seqOn() && prompts.length > 1; // последовательная генерация: в работу сразу идёт только кадр №1
+        const tags = prompts.map((p, i) => buildImageTag(p, i, seq && i > 0));
         const toBlocks = directorToBlocks();
         // в режиме внешних блоков в .mes идут плейсхолдеры, а реальные теги картинок — в extra.extblocks
         const inserts = toBlocks ? prompts.map(() => IMG_PLACEHOLDER) : tags;
@@ -3849,15 +3875,16 @@ ${prose}
         // перерисовать DOM .mes_text, чтобы расширение картинок увидело свежие теги [IMG:GEN]
         try { if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(id, msg); } catch (e) { /* ignore */ }
         try { ctx.saveChat && ctx.saveChat(); } catch (e) { /* ignore */ }
-        retriggerImageExtension(id); // запустить генерацию вставленных кадров
+        retriggerImageExtension(id, { noButton: seq }); // запустить генерацию вставленных кадров (в seq-режиме — только кнопки не жмём: она бы подняла и «ожидающие»)
+        if (seq) seqStart(id, prompts.length); // остальные кадры запускает очередь по одному
         afterDirector(id);           // показать карточку/плеер + прогнать модули-панели
     }
     // запустить генерацию вставленных кадров в расширении картинок
-    function retriggerImageExtension(id) {
+    function retriggerImageExtension(id, opts) {
         const mes = getMesEl(id);
         // 1) хирургично: кнопка «перегенерировать картинки» расширения (megarakk/sillyimages) — без глобальных событий
         const btn = mes && (mes.querySelector('.iig-regenerate-btn') || mes.querySelector('.iig-regen-all-btn'));
-        if (btn) { try { btn.click(); return; } catch (e) { /* ignore */ } }
+        if (btn && !(opts && opts.noButton)) { try { btn.click(); return; } catch (e) { /* ignore */ } }
         // 2) обобщённо: повторно эмитим событие рендера — его слушает любое расширение картинок (megarakk = makeLast)
         const ctx = getCtx(); const E = ctx.event_types || {};
         if (E.CHARACTER_MESSAGE_RENDERED && ctx.eventSource && typeof ctx.eventSource.emit === 'function') {
@@ -3868,6 +3895,148 @@ ${prose}
             try { ctx.eventSource.emit(E.CHARACTER_MESSAGE_RENDERED, id); } catch (e) { _selfEmit.delete(id); }
         }
     }
+    // ╔════════════════════════════════════════════════════════════════╗
+    // ║  ПОСЛЕДОВАТЕЛЬНАЯ ГЕНЕРАЦИЯ КАДРОВ                              ║
+    // ║  Многие API картинок не умеют в параллель: запускаются все N     ║
+    // ║  кадров, работает один, остальные падают с ошибкой и уходят в    ║
+    // ║  ретрай. Поэтому кадры 2..N лежат в сообщении как                ║
+    // ║  src="[IMG:WAIT]" (расширение картинок их игнорирует), а очередь ║
+    // ║  по одному переводит их в [IMG:GEN] — когда предыдущий готов.    ║
+    // ╚════════════════════════════════════════════════════════════════╝
+    const SEQ_FRAME_TIMEOUT_MS = 240000; // столько ждём один кадр, потом идём дальше (чтобы очередь не встала навсегда)
+    const SEQ_POLL_MS = 800;
+    const SEQ_GAP_MS = 700;              // пауза между кадрами: расширение успевает дописать src и закрыть свою обработку
+    const _seqRuns = new Map();          // mesId -> { n, k, swipe, since, retried, cancel }
+    function seqOn() {
+        const s = getSettings();
+        return !!s.enabled && s.seqImages !== false && (s.imgFormat || 'iig') === 'iig';
+    }
+    // выпустить все оставшиеся [IMG:WAIT] разом (при выключении режима посреди серии)
+    function seqReleaseAll() {
+        _seqRuns.forEach(run => {
+            run.cancel = true;
+            const msg = (getCtx().chat || [])[run.id]; if (!msg) return;
+            let any = false;
+            for (let k = 0; k < run.n; k++) any = seqSetTag(msg, k, SEQ_WAIT, '[IMG:GEN]') || any;
+            if (any) {
+                try { getCtx().updateMessageBlock && getCtx().updateMessageBlock(run.id, msg); } catch (e) { /* ignore */ }
+                try { getCtx().saveChat && getCtx().saveChat(); } catch (e) { /* ignore */ }
+                retriggerImageExtension(run.id, { noButton: true });
+            }
+        });
+        _seqRuns.clear();
+    }
+    function seqCancelAll() { _seqRuns.forEach(r => { r.cancel = true; }); _seqRuns.clear(); }
+    // перевести k-й кадр (по data-svn) из from → to в одном тексте
+    function seqFlip(str, k, from, to) {
+        if (!str || str.indexOf(from) === -1) return str;
+        const re = new RegExp('<img\\b[^>]*\\bdata-svn\\s*=\\s*[\'"]' + k + '[\'"][^>]*>', 'gi');
+        return str.replace(re, t => t.split(from).join(to));
+    }
+    // ...и во всех местах, где сообщение хранит теги: .mes, активный свайп, внешние блоки (+ их копия в свайпе)
+    function seqSetTag(msg, k, from, to) {
+        let changed = false;
+        const put = (obj, key) => {
+            if (!obj || typeof obj[key] !== 'string') return;
+            const nv = seqFlip(obj[key], k, from, to);
+            if (nv !== obj[key]) { obj[key] = nv; changed = true; }
+        };
+        const sw = msg.swipe_id;
+        put(msg, 'mes');
+        if (Array.isArray(msg.swipes) && sw != null) put(msg.swipes, sw);
+        put(msg.extra, 'extblocks');
+        if (sw != null && msg.swipe_info && msg.swipe_info[sw]) put(msg.swipe_info[sw].extra, 'extblocks');
+        return changed;
+    }
+    // режим «основной ИИ сам ставит теги»: до старта расширения картинок (MESSAGE_RECEIVED) откладываем кадры 2..N
+    function seqHoldOnReceive(id) {
+        try {
+            if (!seqOn()) return;
+            const msg = (getCtx().chat || [])[id]; if (!msg || msg.is_user) return;
+            const mes = msg.mes || '';
+            if (mes.indexOf('[IMG:GEN]') === -1) return;
+            const re = /<img\b[^>]*data-iig-instruction[^>]*>/gi;
+            const tags = mes.match(re) || [];
+            if (tags.length < 2 || tags.some(t => /data-svn/i.test(t)) || tags.some(t => t.indexOf('[IMG:GEN]') === -1)) return;
+            let i = 0;
+            const out = mes.replace(re, t => {
+                const k = i++;
+                let x = t.replace(/^<img\b/i, `<img data-svn="${k}"`);
+                if (k > 0) x = x.split('[IMG:GEN]').join(SEQ_WAIT);
+                return x;
+            });
+            msg.mes = out;
+            if (Array.isArray(msg.swipes) && msg.swipe_id != null) msg.swipes[msg.swipe_id] = out;
+            seqStart(id, tags.length);
+        } catch (e) { console.warn('[VN] seqHoldOnReceive', e); }
+    }
+    function seqStart(id, n) {
+        if (!(n > 1)) return;
+        const msg = (getCtx().chat || [])[id]; if (!msg) return;
+        const prev = _seqRuns.get(id); if (prev) prev.cancel = true;
+        const run = { id, n, k: 0, swipe: msg.swipe_id || 0, since: Date.now(), retried: false, cancel: false };
+        _seqRuns.set(id, run);
+        setTimeout(() => seqTick(run), 1500);
+    }
+    // 'ready' | 'failed' | 'busy' для k-го кадра
+    function seqFrameState(id, k) {
+        if (resolveImageUrls(id, k + 1)[k]) return 'ready';
+        const mes = getMesEl(id);
+        if (mes) {
+            const scope = mes.querySelector('.mes_block') || mes;
+            const el = scope.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')[k];
+            if (el && el.classList && (el.classList.contains('iig-error-image') || /error\.svg/.test(el.getAttribute('src') || ''))) return 'failed';
+        }
+        return 'busy';
+    }
+    function seqFindRegenBtn(mes, k) {
+        if (!mes) return null;
+        let btn = mes.querySelector(`.iig-regen-single-btn[data-tag-index="${k}"]`);
+        if (!btn) {
+            const media = Array.from(mes.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]'));
+            const host = media[k] && media[k].closest('.iig-img-host');
+            btn = (host && (host.querySelector('.iig-img-regen') || host.querySelector('.iig-img-retry'))) || null;
+        }
+        return btn;
+    }
+    function seqTick(run) {
+        const again = () => { if (!run.cancel) setTimeout(() => seqTick(run), SEQ_POLL_MS); };
+        if (run.cancel) return;
+        const ctx = getCtx();
+        const msg = (ctx.chat || [])[run.id];
+        if (!msg || (msg.swipe_id || 0) !== run.swipe) { _seqRuns.delete(run.id); return; }
+        const st = seqFrameState(run.id, run.k);
+        const timedOut = Date.now() - run.since > SEQ_FRAME_TIMEOUT_MS;
+        if (st === 'busy' && !timedOut) return again();
+        if (st === 'failed' && !run.retried && !timedOut) {
+            // одна попытка «Повторить» на кадр (ретраи самого расширения могут быть отключены/исчерпаны)
+            const btn = seqFindRegenBtn(getMesEl(run.id), run.k);
+            if (btn) { run.retried = true; run.since = Date.now(); try { btn.click(); } catch (e) { /* ignore */ } return setTimeout(() => seqTick(run), 3000); }
+        }
+        // кадр k закончился (готов / упал окончательно / завис) → выпускаем следующий
+        run.k++; run.retried = false;
+        if (run.k >= run.n) { _seqRuns.delete(run.id); scheduleCardRefresh && scheduleCardRefresh(run.id); return; }
+        setTimeout(() => {
+            if (run.cancel) return;
+            const m2 = (getCtx().chat || [])[run.id];
+            if (!m2 || (m2.swipe_id || 0) !== run.swipe) { _seqRuns.delete(run.id); return; }
+            if (seqSetTag(m2, run.k, SEQ_WAIT, '[IMG:GEN]')) {
+                try { getCtx().updateMessageBlock && getCtx().updateMessageBlock(run.id, m2); } catch (e) { /* ignore */ }
+                try { getCtx().saveChat && getCtx().saveChat(); } catch (e) { /* ignore */ }
+                retriggerImageExtension(run.id, { noButton: true });
+            }
+            run.since = Date.now();
+            again();
+        }, SEQ_GAP_MS);
+    }
+    // кадр k ещё «в очереди» (ждёт своей очереди, генерация не начиналась)
+    function frameQueued(id, k) {
+        if (!(k >= 0)) return false;
+        const msg = (getCtx().chat || [])[id]; if (!msg) return false;
+        const tags = msgSource(msg).match(imgMarkRe('gi')) || [];
+        return !!(tags[k] && tags[k].indexOf(SEQ_WAIT) !== -1);
+    }
+
     // хвост обработки: карточка + (если ждали/автооткрытие) плеер + модули-панели
     function afterDirector(id) {
         const s = getSettings();
@@ -4720,12 +4889,12 @@ ${prose}
         try { applyGlobalTheme(); } catch (e) { /* ignore */ } // тема на карточки-лаунчеры в ленте чата
         const E = ctx.event_types || {};
         if (E.APP_READY) ctx.eventSource.on(E.APP_READY, () => { createSettingsUI(); updateInjection(); loadSpriteCache(); setTimeout(decorateAll, 300); });
-        if (E.CHAT_CHANGED) ctx.eventSource.on(E.CHAT_CHANGED, () => { _turnApplied.clear(); _turnSnapshots.clear(); _liteError.clear(); _sceneCache.clear(); _directorDone.clear(); _directorBusy.clear(); _selfEmit.clear(); updateInjection(); bgm.lastQuery = ''; if (player.open) bgmRefreshUI(); setTimeout(decorateAll, 200); });
+        if (E.CHAT_CHANGED) ctx.eventSource.on(E.CHAT_CHANGED, () => { _turnApplied.clear(); _turnSnapshots.clear(); _liteError.clear(); _sceneCache.clear(); _directorDone.clear(); _directorBusy.clear(); _selfEmit.clear(); seqCancelAll(); updateInjection(); bgm.lastQuery = ''; if (player.open) bgmRefreshUI(); setTimeout(decorateAll, 200); });
         setTimeout(() => { createSettingsUI(); decorateAll(); }, 1500);
         for (const name of ['GENERATION_STARTED', 'GENERATE_BEFORE_COMBINE_PROMPTS', 'MESSAGE_SENT']) {
             const ev = E[name]; if (ev) ctx.eventSource.on(ev, () => { try { updateInjection(); } catch (e) { /* ignore */ } });
         }
-        if (E.MESSAGE_RECEIVED) ctx.eventSource.on(E.MESSAGE_RECEIVED, enforceImageDefaults);
+        if (E.MESSAGE_RECEIVED) ctx.eventSource.on(E.MESSAGE_RECEIVED, (id) => { enforceImageDefaults(id); seqHoldOnReceive(id); });
         if (E.CHARACTER_MESSAGE_RENDERED) ctx.eventSource.on(E.CHARACTER_MESSAGE_RENDERED, onCharMessageRendered);
         if (E.STREAM_TOKEN_RECEIVED) ctx.eventSource.on(E.STREAM_TOKEN_RECEIVED, onStreamToken);
         for (const name of ['GENERATION_ENDED', 'GENERATION_STOPPED']) { const ev = E[name]; if (ev) ctx.eventSource.on(ev, onGenDone); }
