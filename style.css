@@ -93,6 +93,8 @@ body.svn-lock { overflow: hidden !important; }
        чтобы панели соответствовали выбранной теме, а не перекрашивались под настроение сцены */
     --svn-surface: color-mix(in srgb, var(--svn-theme-accent, var(--svn-accent)) 11%, rgba(18, 18, 22, 0.62));
     --svn-surface-bd: color-mix(in srgb, var(--svn-theme-accent, var(--svn-accent)) 30%, rgba(255, 255, 255, 0.13));
+    /* «свой» vw/vh плеера: в принудительно повёрнутом режиме стороны меняются местами (см. .svn-rotated ниже) */
+    --svn-vw: 1vw; --svn-vh: 1vh;
     position: fixed; inset: 0; width: 100%; height: 100dvh; z-index: 2147483600;
     background: #000; color: #fff; overflow: hidden; overscroll-behavior: none;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
@@ -101,11 +103,18 @@ body.svn-lock { overflow: hidden !important; }
 #svn-overlay.svn-show { opacity: 1; visibility: visible; }
 /* принудительная горизонталь (кнопка-поворот): меняем местами стороны и крутим вокруг центра —
    плеер заполняет экран в ландшафте, даже если автоповорот телефона выключен */
-#svn-overlay.svn-rotated {
-    inset: auto; top: 50%; left: 50%;
-    width: 100vh; width: 100dvh; height: 100vw;
-    transform: translate(-50%, -50%) rotate(90deg);
+/* поворот работает ТОЛЬКО пока телефон физически в портрете: если экран уже горизонтальный
+   (автоповорот), плеер не крутится второй раз — иначе текст ложится на бок */
+@media (orientation: portrait) {
+    #svn-overlay.svn-rotated {
+        inset: auto; top: 50%; left: 50%;
+        width: 100vh; width: 100dvh; height: 100vw;
+        --svn-vw: 1dvh; --svn-vh: 1vw;
+        transform: translate(-50%, -50%) rotate(90deg);
+    }
 }
+/* в горизонтали кнопка-поворот не нужна */
+@media (orientation: landscape) { #svn-overlay [data-act="rotate"] { display: none; } }
 
 /* фон-сцена: две накладывающиеся «полки» для кроссфейда */
 #svn-stage { position: absolute; inset: 0; z-index: 1; }
@@ -153,7 +162,7 @@ body.svn-lock { overflow: hidden !important; }
 #svn-sprites { position: absolute; inset: 0; z-index: 2; pointer-events: none; transition: transform .85s cubic-bezier(.22,.61,.36,1); will-change: transform; }
 .svn-spr {
     position: absolute; bottom: 0; z-index: 2;
-    max-height: 86vh; max-width: 42vw; object-fit: contain; object-position: bottom center;
+    max-height: calc(86 * var(--svn-vh)); max-width: calc(42 * var(--svn-vw)); object-fit: contain; object-position: bottom center;
     filter: drop-shadow(0 8px 26px rgba(0, 0, 0, 0.55));
     opacity: 0; transform: translateX(-50%) translateY(16px) scale(.985);
     transition: opacity .34s ease, transform .34s ease, filter .34s ease, left .34s ease;
@@ -180,7 +189,7 @@ body.svn-lock { overflow: hidden !important; }
 #svn-lb-top { top: 0; }
 #svn-lb-bot { bottom: 0; }
 #svn-overlay.svn-letterbox #svn-lb-top,
-#svn-overlay.svn-letterbox #svn-lb-bot { height: 7.5vh; }
+#svn-overlay.svn-letterbox #svn-lb-bot { height: calc(7.5 * var(--svn-vh)); }
 
 #svn-click { position: absolute; inset: 0; z-index: 5; cursor: pointer; touch-action: pan-y; }
 /* широкий фон можно протянуть по горизонтали */
@@ -212,7 +221,7 @@ body.svn-lock { overflow: hidden !important; }
 /* ── диалоговое окно ────────────────────────────────────────────────── */
 .svn-dialog {
     position: absolute; left: 50%; bottom: var(--svn-dy, 22px); transform: translateX(-50%);
-    width: min(880px, calc(100vw - 28px)); max-width: calc(100vw - 28px); z-index: 7;
+    width: min(880px, calc(calc(100 * var(--svn-vw)) - 28px)); max-width: calc(calc(100 * var(--svn-vw)) - 28px); z-index: 7;
     padding: var(--svn-pad, 20px) calc(var(--svn-pad, 20px) + 4px) calc(var(--svn-pad, 20px) - 4px);
     border: var(--svn-border, 1px) solid var(--svn-border-color, rgba(255, 255, 255, 0.14)); border-radius: var(--svn-radius, 22px);
     background: rgba(20, 20, 22, 0.62);
@@ -341,7 +350,7 @@ body.svn-lock { overflow: hidden !important; }
 #svn-overlay.svn-mode-cinematic .svn-dialog {
     background: transparent !important; border: none !important; box-shadow: none !important;
     -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
-    left: 0; right: 76px; width: min(920px, calc(100vw - 140px)); max-width: none;
+    left: 0; right: 76px; width: min(920px, calc(calc(100 * var(--svn-vw)) - 140px)); max-width: none;
     margin-left: auto; margin-right: auto; transform: none;
 }
 #svn-overlay.svn-mode-cinematic .svn-dialog.svn-dialog-hidden { transform: translateY(24px); }
@@ -352,7 +361,7 @@ body.svn-lock { overflow: hidden !important; }
     position: fixed; right: 12px; top: 14px; left: auto; bottom: auto;
     transform: none;
     flex-direction: column; gap: 5px;
-    max-height: calc(100vh - 28px); overflow-y: auto; overflow-x: hidden;
+    max-height: calc(calc(100 * var(--svn-vh)) - 28px); overflow-y: auto; overflow-x: hidden;
 }
 #svn-overlay.svn-mode-cinematic #svn-ctrl::-webkit-scrollbar { display: none; }
 /* кнопку «свернуть» — в начало столбца: в свёрнутом виде она сидит в правом ВЕРХНЕМ углу (без зависания по центру и без прыжка) */
@@ -371,7 +380,7 @@ body.svn-lock { overflow: hidden !important; }
 /* ── popover настроек / режимов ─────────────────────────────────────── */
 .svn-settings {
     position: fixed; left: 50%; transform: translateX(-50%); bottom: 102px; top: auto; right: auto;
-    min-width: 248px; max-width: min(440px, calc(100vw - 24px)); max-height: 70vh; overflow-y: auto;
+    min-width: 248px; max-width: min(440px, calc(calc(100 * var(--svn-vw)) - 24px)); max-height: calc(70 * var(--svn-vh)); overflow-y: auto;
     display: none; flex-direction: column; gap: 7px; padding: 14px 16px;
     border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 16px; background: rgba(16, 16, 20, 0.96);
     -webkit-backdrop-filter: blur(40px) saturate(180%); backdrop-filter: blur(40px) saturate(180%);
@@ -469,7 +478,7 @@ body.svn-lock { overflow: hidden !important; }
 
 /* ── панель каста (ручное управление спрайтами на сцене) ────────────── */
 .svn-cast-panel { min-width: 268px; }
-.svn-cast-list { display: flex; flex-direction: column; gap: 5px; margin: 4px 0 2px; max-height: 42vh; overflow-y: auto; padding-right: 2px; }
+.svn-cast-list { display: flex; flex-direction: column; gap: 5px; margin: 4px 0 2px; max-height: calc(42 * var(--svn-vh)); overflow-y: auto; padding-right: 2px; }
 .svn-cast-list::-webkit-scrollbar { width: 5px; }
 .svn-cast-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 8px; }
 .svn-cast-row {
@@ -591,16 +600,16 @@ body.svn-lock { overflow: hidden !important; }
     .svn-card-play { width: 54px; height: 54px; font-size: 21px; }
     .svn-card-title { font-size: 15px; -webkit-line-clamp: 1; }
     .svn-card-main { padding: 26px 13px 12px; }
-    .svn-spr { max-width: 56vw; max-height: 66vh; }
+    .svn-spr { max-width: calc(56 * var(--svn-vw)); max-height: calc(66 * var(--svn-vh)); }
     .svn-spr-farleft { left: 16%; } .svn-spr-left { left: 30%; } .svn-spr-right { left: 70%; } .svn-spr-farright { left: 84%; }
     /* поповеры настроек и каста — нижняя «шторка» на всю ширину (не обрезаются полосой кнопок) */
     .svn-settings, .svn-cast-panel {
         position: fixed; left: 0; right: 0; bottom: 0; top: auto; transform: none;
-        width: 100%; min-width: 0; max-width: none; max-height: 80vh;
+        width: 100%; min-width: 0; max-width: none; max-height: calc(80 * var(--svn-vh));
         border-radius: 18px 18px 0 0; padding-bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 40;
     }
-    .svn-cast-list { max-height: 48vh; }
-    #svn-overlay.svn-letterbox #svn-lb-top, #svn-overlay.svn-letterbox #svn-lb-bot { height: 5vh; }
+    .svn-cast-list { max-height: calc(48 * var(--svn-vh)); }
+    #svn-overlay.svn-letterbox #svn-lb-top, #svn-overlay.svn-letterbox #svn-lb-bot { height: calc(5 * var(--svn-vh)); }
     .svn-picker-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 9px; }
     .svn-mgr-body { grid-template-columns: 1fr !important; }
     .svn-expr-grid { grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)) !important; }
@@ -614,7 +623,7 @@ body.svn-lock { overflow: hidden !important; }
     font-family: var(--svn-font, inherit);
     display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
     padding: max(12px, env(safe-area-inset-top)) 12px 0 max(12px, env(safe-area-inset-left));
-    max-width: min(42vw, 380px); pointer-events: none;
+    max-width: min(calc(42 * var(--svn-vw)), 380px); pointer-events: none;
 }
 #svn-panels-list { display: flex; flex-direction: column; gap: 6px; }
 /* тумблер «свернуть/показать» — крошечная кнопка в углу HUD */
@@ -653,7 +662,7 @@ body.svn-lock { overflow: hidden !important; }
 .svn-pan-bit { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .svn-pan-bit i { opacity: 0.72; font-size: 12px; }
 @media (max-width: 600px) {
-    #svn-panels { max-width: calc(100vw - 24px); }
+    #svn-panels { max-width: calc(calc(100 * var(--svn-vw)) - 24px); }
     .svn-pan-chip { font-size: 12px; padding: 6px 11px; }
 }
 
@@ -699,7 +708,7 @@ body.svn-lock { overflow: hidden !important; }
 #svn-floats {
     position: absolute; left: 50%; top: 13%; transform: translateX(-50%); z-index: 8;
     display: flex; flex-direction: column; align-items: center; gap: 8px;
-    width: max-content; max-width: min(560px, 86vw); pointer-events: none;
+    width: max-content; max-width: min(560px, calc(86 * var(--svn-vw))); pointer-events: none;
 }
 .svn-float {
     max-width: 100%; padding: 10px 18px; border-radius: 14px; pointer-events: auto; cursor: pointer;

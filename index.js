@@ -1132,6 +1132,11 @@ ${roster}
         document.body.appendChild(ov);
         player.el = ov;
         wireOverlay(ov);
+        // смена ориентации/размера окна (автоповорот телефона, адресная строка): пересчитать панораму картинки
+        let _rzT = null;
+        const onResize = () => { clearTimeout(_rzT); _rzT = setTimeout(() => { if (player.open) { try { measurePan(); } catch (_) { /* ignore */ } } }, 120); };
+        window.addEventListener('resize', onResize);
+        window.addEventListener('orientationchange', onResize);
         fillSettingSelects(ov);
         // выносим поповеры из полосы кнопок (.svn-ctrl с overflow+blur обрезает их на мобиле)
         const sEl = ov.querySelector('#svn-settings'); if (sEl) ov.appendChild(sEl);
