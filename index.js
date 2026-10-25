@@ -47,6 +47,9 @@
         injectPrompt: true,    // инжектить наш VN-промпт (выключи, если используешь свой промпт картинок)
         detectAnyImages: true, // распознавать картинки в ЛЮБОЙ обёртке (<illust>/<image_lite>/<div>), не только <vn>
         extBlocksImages: true, // подхватывать картинки из блоков ExtBlocks (message.extra.extblocks) — как «Process external blocks» у sillyimages
+        directorViaExtBlocks: true, // писать промпты кадров через API выбранного блока ExtBlocks (его пресет + профиль подключения), а не через «мини-ИИ»
+        appearanceLock: '',    // дословная внешность: строки «Имя|Алиас = теги» — режиссёр пишет [[Имя]], код подставляет теги целиком
+        directorBlock: '',     // имя блока ExtBlocks, чей ПРОМПТ режиссёр берёт как инструкцию для промптов кадров (сам блок в ExtBlocks держим ВЫКЛЮЧЕННЫМ)
         seqImages: true,       // генерировать кадры ПО ОДНОМУ (следующий стартует, когда предыдущий готов) — для API, где нельзя параллельно
         imageSize: '1K',       // качество кадров (image_size): '1K' | '2K' | '4K'; 2K/4K жёстко прописываются в тег
         imgFormat: 'iig',      // какой тег картинок наш промпт велит ИИ эмитить: 'iig' (sillyimages) | 'image' (<image>) | 'other' (своё расширение)
@@ -147,6 +150,298 @@
     }
 
     function saveSettings() { try { getCtx().saveSettingsDebounced(); } catch (e) { /* ignore */ } }
+
+    // ╔════════════════════════════════════════════════════════════════╗
+    // ║  ОТЛАДКА: кольцевой лог в памяти (настройки → «Источник тегов  ║
+    // ║  картинок» → «Отладка»), копируется кнопкой и присылается мне   ║
+    // ╚════════════════════════════════════════════════════════════════╝
+    const _dbg = [];
+    const DBG_MAX = 600;
+    function dbg(tag, data) {
+        try {
+            const d = new Date();
+            const pad = (n, l) => String(n).padStart(l || 2, '0');
+            const ts = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+            let js = '';
+            if (data !== undefined) { try { js = typeof data === 'string' ? data : JSON.stringify(data); } catch (e) { js = String(data); } }
+            if (js.length > 900) js = js.slice(0, 900) + '…(+' + (js.length - 900) + ')';
+            _dbg.push(`${ts} [${tag}] ${js}`);
+            if (_dbg.length > DBG_MAX) _dbg.splice(0, _dbg.length - DBG_MAX);
+            console.log('[VN dbg]', tag, data === undefined ? '' : data);
+        } catch (e) { /* ignore */ }
+    }
+    function dbgEnv() {
+        const ctx = getCtx(); const s = getSettings();
+        const eb = ctx.extensionSettings && ctx.extensionSettings.ExtBlocks;
+        const iig = ctx.extensionSettings && ctx.extensionSettings.inline_image_gen;
+        let blocks = [];
+        try { blocks = extBlocksList().map(b => ({ n: b.name, off: b.disabled, t: b.type, scoped: b.scoped })); } catch (e) { /* ignore */ }
+        return {
+            view: `${window.innerWidth}x${window.innerHeight}`, ua: (navigator.userAgent || '').slice(0, 90),
+            settings: { enabled: s.enabled, autoDirector: s.autoDirector, imgFormat: s.imgFormat, extBlocksImages: s.extBlocksImages, seqImages: s.seqImages,
+                        minImages: s.minImages, maxImages: s.maxImages, directorBlock: s.directorBlock, topUpExtFrames: s.topUpExtFrames, imageSize: s.imageSize, imgDetect: s.imgDetect || '' },
+            extblocks: eb ? { enabled: eb.extblocks_is_enabled, activeSet: eb.active_set, blocks } : null,
+            inline_image_gen: iig ? { externalBlocks: iig.externalBlocks, keys: Object.keys(iig).slice(0, 14) } : null,
+        };
+    }
+    function dbgText() {
+        let head = '';
+        try { head = JSON.stringify(dbgEnv()); } catch (e) { head = String(e); }
+        return `=== VN debug (${new Date().toISOString()}) ===\nENV ${head}\n` + _dbg.join('\n');
+    }
+    // состояние картинок сообщения: что лежит в .mes / extra.extblocks (src: GEN/WAIT/url/none) и что реально нарисовано в DOM
+    function dbgSnapshot(id, why) {
+        try {
+            const msg = (getCtx().chat || [])[id];
+            if (!msg) return dbg('snap', { id, why, msg: null });
+            const states = (str) => (String(str || '').match(imgMarkRe('gi')) || []).map(tag => {
+                const m = tag.match(/src\s*=\s*["']([^"']*)["']/i); const src = m ? m[1] : '';
+                return src === '[IMG:GEN]' ? 'GEN' : (src === SEQ_WAIT || src === '[IMG:WAIT]') ? 'WAIT' : src ? ('url…' + src.slice(-22)) : 'nosrc';
+            });
+            const eb = (msg.extra && msg.extra.extblocks) || '';
+            const sw = msg.swipe_id;
+            const swEb = (sw != null && msg.swipe_info && msg.swipe_info[sw] && msg.swipe_info[sw].extra && msg.swipe_info[sw].extra.extblocks) || '';
+            const el = getMesEl(id);
+            const dom = el ? Array.from(el.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')).map(e => (e.classList && e.classList.contains('iig-error-image')) ? 'ERR' : ((e.getAttribute('src') || '').slice(-22) || 'nosrc')) : null;
+            let scene = null;
+            try { const sc = parseSceneCached(id); if (sc) scene = { frames: sc.frames.length, slots: sc.slots.length }; } catch (e) { /* ignore */ }
+            dbg('snap', { id, why, swipe: sw, mesLen: (msg.mes || '').length, placeholders: ((msg.mes || '').match(/<!--svn-img-->/g) || []).length, mesTags: states(msg.mes),
+                          ebLen: eb.length, ebTags: states(eb), swipeEbTags: states(swEb), dom, scene, done: _directorDone.get(id), busy: _directorBusy.has(id) });
+        } catch (e) { dbg('snap-err', String(e && e.message || e)); }
+    }
+    function dbgSnapSoon(id, why) { [3000, 15000, 45000].forEach(ms => setTimeout(() => dbgSnapshot(id, `${why}+${ms / 1000}s`), ms)); }
+
+
+    // ── ЗАЩИТА: пробелы в путях готовых картинок ──
+    // Расширение картинок (sillywardrobe 3.0) достаёт src регуляркой, которая режет путь по первому пробелу:
+    // '/user/images/Xie Yue, Lord of the Demon/iig_x.png' → '/user/images/Xie' → «файл не существует» → оно ПЕРЕГЕНЕРИРУЕТ
+    // уже готовую картинку на каждом проходе (а каждый наш повтор события — это проход). Кодируем пробелы (%20): путь остаётся
+    // рабочим, но без пробелов его уже не режут. Возвращает true, если что-то поправили.
+    function fixSpacedSrcs(msg) {
+        if (!msg) return false;
+        let changed = false;
+        const fixStr = (s) => {
+            if (typeof s !== 'string' || s.indexOf('data-iig-instruction') === -1) return s;
+            return s.replace(imgMarkRe('gi'), tag => tag.replace(/(\bsrc\s*=\s*")(\/[^"]*)(")/i, (m, a, b, c) => (/\s/.test(b) ? a + b.replace(/\s/g, '%20') + c : m)));
+        };
+        const put = (obj, key) => {
+            if (!obj || typeof obj[key] !== 'string') return;
+            const nv = fixStr(obj[key]);
+            if (nv !== obj[key]) { obj[key] = nv; changed = true; }
+        };
+        const sw = msg.swipe_id;
+        put(msg, 'mes');
+        if (Array.isArray(msg.swipes) && sw != null) put(msg.swipes, sw);
+        put(msg.extra, 'extblocks');
+        put(msg.extra, 'display_text');
+        if (sw != null && msg.swipe_info && msg.swipe_info[sw]) { put(msg.swipe_info[sw].extra, 'extblocks'); put(msg.swipe_info[sw].extra, 'display_text'); }
+        return changed;
+    }
+    // ExtBlocks держит в extra.display_text копию «текст + его блоки» (для показа). Расширение картинок (sillywardrobe 3.0), если display_text
+    // есть и в нём найдены теги, разбирает ТОЛЬКО его, а extra.extblocks не смотрит вообще. Наши кадры лежат в extblocks (ExtBlocks их
+    // в display_text не кладёт — они не «его блок»), поэтому расширение их НЕ ВИДЕЛО: молча гоняло один-единственный тег из display_text
+    // (заново, из-за пробелов в пути) — отсюда повторные картинки и «застрявшая» очередь. Держим display_text в точном соответствии:
+    // состояния всех тегов (ссылки, [IMG:GEN], ожидание) копируем из extblocks, а недостающие наши кадры дописываем в конец.
+    function mirrorToDisplayText(msg) {
+        try {
+            const ex = msg && msg.extra; if (!ex || typeof ex.display_text !== 'string') return false;
+            const ebTags = String(ex.extblocks || '').match(imgMarkRe('gi')) || [];
+            if (!ebTags.length) return false;
+            const keyOf = (tg) => tg.replace(/(\bsrc\s*=\s*)(["'])[^"']*\2/i, '$1""');
+            const map = new Map(); ebTags.forEach(tg => map.set(keyOf(tg), tg));
+            const seen = new Set(); let changed = false;
+            let dt = ex.display_text.replace(imgMarkRe('gi'), (tg) => {
+                const k = keyOf(tg), e = map.get(k);
+                if (e === undefined) return tg;
+                seen.add(k); if (e !== tg) changed = true; return e;
+            });
+            const missing = ebTags.filter(tg => /\bdata-svn\s*=/.test(tg) && !seen.has(keyOf(tg)));
+            if (missing.length) { dt = dt.replace(/\s+$/, '') + '\n' + missing.join('\n'); changed = true; }
+            if (changed) ex.display_text = dt;
+            return changed;
+        } catch (e) { dbg('mirror-err', String(e && e.message || e)); return false; }
+    }
+    // всё, что нужно сделать с сообщением прямо перед проходом расширения картинок
+    function prepForImageExt(msg) {
+        const a = fixSpacedSrcs(msg);
+        const b = mirrorToDisplayText(msg);
+        return a || b;
+    }
+    function fixSpacedSrcsAll(why) {
+        try {
+            const ctx = getCtx(); const chat = ctx.chat || []; let n = 0;
+            for (let i = Math.max(0, chat.length - 60); i < chat.length; i++) { if (!chat[i].is_user && prepForImageExt(chat[i])) n++; }
+            if (n) { dbg('fix-spaces', { why, messages: n }); try { ctx.saveChat && ctx.saveChat(); } catch (e) { /* ignore */ } }
+        } catch (e) { /* ignore */ }
+    }
+
+
+    // ── запрос к ТОМУ ЖЕ API, что использует блок ExtBlocks ──
+    // ExtBlocks берёт у блока api_preset (big/medium/small) → в пресете имя профиля подключения (Connection Manager), температура, max_tokens… и шлёт
+    // запрос на /api/backends/chat-completions/generate. Делаем так же: режиссёр пишет промпты кадров не «мини-ИИ», а именно этой моделью.
+    function extBlocksApiInfo(blockName) {
+        const ctx = getCtx(); const eb = ctx.extensionSettings && ctx.extensionSettings.ExtBlocks;
+        const cm = ctx.extensionSettings && ctx.extensionSettings.connectionManager;
+        if (!eb || !cm || !Array.isArray(cm.profiles) || !cm.profiles.length) return null;
+        const b = extBlocksList().find(x => x.name === blockName);
+        const presetName = String((b && b.block.api_preset) || eb.active_api_preset || 'big');
+        const presets = eb.api_presets || {};
+        const preset = presets[presetName] || presets[eb.active_api_preset] || {};
+        const profile = cm.profiles.find(p => p.name === preset.connection_profile) || cm.profiles[0];
+        return { presetName, preset, profile, source: profile.api === 'google' ? 'makersuite' : profile.api };
+    }
+    async function askViaExtBlocks(sys, usr, maxTokens, blockName) {
+        const info = extBlocksApiInfo(blockName);
+        if (!info) throw new Error('ExtBlocks: не найдены профили подключения');
+        const ctx = getCtx(); const { preset, profile, source } = info;
+        const data = {
+            messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }],
+            model: profile.model, temperature: preset.temperature != null ? preset.temperature : 1, stream: false,
+            chat_completion_source: source, max_tokens: Math.max(maxTokens || 0, preset.max_tokens || 0), reasoning_effort: preset.reasoning_effort,
+        };
+        if (profile['secret-id']) data.secret_id = profile['secret-id'];
+        if (preset.top_p != null && preset.top_p !== 1.0) data.top_p = preset.top_p;
+        let proxies = [];
+        try { const m = await import('/scripts/openai.js'); proxies = m.proxies || []; } catch (e) { /* ignore */ }
+        const px = proxies.find(x => x.name === profile.proxy);
+        if (px && source !== 'openrouter') { data.reverse_proxy = px.url; data.proxy_password = px.password; }
+        const apiUrl = typeof profile['api-url'] === 'string' ? profile['api-url'].trim().replace(/\/+$/, '') : '';
+        const cs = ctx.chatCompletionSettings || {};
+        if (source === 'custom') {
+            if (apiUrl) data.custom_url = apiUrl;
+            const pp = profile['prompt-post-processing'] != null ? profile['prompt-post-processing'] : cs.custom_prompt_post_processing;
+            if (pp) data.custom_prompt_post_processing = pp;
+            if (cs.custom_include_body) data.custom_include_body = cs.custom_include_body;
+            if (cs.custom_exclude_body) data.custom_exclude_body = cs.custom_exclude_body;
+            if (cs.custom_include_headers) data.custom_include_headers = cs.custom_include_headers;
+            if (!data.custom_url) throw new Error('в профиле подключения нет API URL');
+        } else if (source === 'vertexai' && apiUrl) {
+            data.vertexai_region = apiUrl;
+            if (cs.vertexai_auth_mode) data.vertexai_auth_mode = cs.vertexai_auth_mode;
+            if (cs.vertexai_express_project_id) data.vertexai_express_project_id = cs.vertexai_express_project_id;
+        } else if (source === 'zai' && apiUrl) data.zai_endpoint = apiUrl;
+        if (source === 'makersuite' || source === 'claude') data.use_sysprompt = true;
+        if (preset.confirmation_jb) { data.messages.push({ role: 'assistant', content: '[Please confirm your request]' }); data.messages.push({ role: 'user', content: '[I confirm]' }); }
+        dbg('director-api', { via: 'extblocks', block: blockName, preset: info.presetName, profile: profile.name, source, model: profile.model, maxTokens: data.max_tokens });
+        const ac = new AbortController(); const to = setTimeout(() => ac.abort(), 240000);
+        let resp;
+        try { resp = await fetch('/api/backends/chat-completions/generate', { method: 'POST', body: JSON.stringify(data), headers: ctx.getRequestHeaders(), signal: ac.signal }); }
+        finally { clearTimeout(to); }
+        if (!resp.ok) {
+            let em = ''; try { const j = await resp.clone().json(); em = (j && j.error && j.error.message) || j.message || ''; } catch (e) { /* ignore */ }
+            throw new Error(`API блока ответил ${resp.status}${em ? ': ' + String(em).slice(0, 160) : ''}`);
+        }
+        const j = await resp.json();
+        if (j && j.error) throw new Error(String(j.error.message || 'API вернул ошибку').slice(0, 200));
+        const text = source === 'claude' ? (j.content && j.content[0] && j.content[0].text) : (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content);
+        if (!text) throw new Error('API блока вернул пустой ответ');
+        return String(text).trim();
+    }
+
+    // ── блоки ExtBlocks: список (для выбора) и текст промпта блока ──
+    function extBlocksList() {
+        const out = [];
+        try {
+            const ctx = getCtx(); const eb = ctx.extensionSettings && ctx.extensionSettings.ExtBlocks;
+            const seen = new Set();
+            const add = (b, scoped) => { if (!b || !b.name || seen.has(b.name)) return; seen.add(b.name); out.push({ name: b.name, disabled: !!b.disabled, type: b.block_type || 'generated', scoped, block: b }); };
+            const ch = ctx.characters && ctx.characters[ctx.characterId];
+            const emb = ch && ch.data && ch.data.extensions && ch.data.extensions.ExtBlocks;
+            if (Array.isArray(emb)) emb.forEach(b => add(b, true));
+            if (eb && Array.isArray(eb.sets)) {
+                const set = eb.sets[eb.active_set_idx] || eb.sets.find(x => x && x.name === eb.active_set);
+                if (set && Array.isArray(set.global_blocks)) set.global_blocks.forEach(b => add(b, false));
+            }
+        } catch (e) { /* ignore */ }
+        return out;
+    }
+    // текст-часть промпта блока (его «text»-элементы контекста по порядку, с подстановкой макросов), без истории чата
+
+    // Полный контекст блока ExtBlocks — так, как его собрал бы сам ExtBlocks (ContextService): text-элементы с макросами,
+    // «последние сообщения» (с префиксами/суффиксами), «предыдущие блоки» из прошлых сообщений. В порядке элементов блока.
+    function extBlockContext(name, msgId) {
+        const out = { text: '', items: [], appearances: [] };
+        if (!name) return out;
+        const b = extBlocksList().find(x => x.name === name); if (!b || !Array.isArray(b.block.context)) return out;
+        const ctx = getCtx(); const chat = ctx.chat || [];
+        const sub = (s) => { const v = String(s == null ? '' : s); try { return typeof ctx.substituteParams === 'function' ? ctx.substituteParams(v) : v; } catch (e) { return v; } };
+        const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // из сообщений убираем наши плейсхолдеры и тяжёлые <img data-iig-instruction> — они не нужны режиссёру и раздувают контекст
+        const clean = (s) => String(s || '').replace(/<!--svn-img-->/gi, '').replace(/<img\b[^>]*data-iig-instruction[^>]*>/gi, '').trim();
+        const lastMessages = (it) => {
+            let visible = chat.slice(0, msgId + 1).filter(m => m && m.is_system !== true);
+            const offset = it.messages_offset || 0;
+            if (offset > 0 && visible.length > offset) visible = visible.slice(0, -offset);
+            let count = it.messages_count;
+            if (count === undefined) {
+                const ks = it.keyword_stopper; if (!ks) return '';
+                let idx = visible.slice(0, -1).findLastIndex(m => String(m.mes || '').includes(ks)); if (idx === -1) idx = 0;
+                count = visible.length - idx;
+            }
+            const arr = count > 0 ? visible.slice(-count) : (count < 0 ? visible.slice(0, -count) : []);
+            const sep = it.messages_separator === 'newline' ? '\n' : it.messages_separator === 'space' ? ' ' : '\n\n';
+            return arr.map((m, ix) => {
+                const isU = !!m.is_user; const pre = sub(isU ? it.user_prefix : it.char_prefix); const suf = sub(isU ? it.user_suffix : it.char_suffix);
+                let tx = clean(m.mes);
+                try { if (typeof ctx.getRegexedString === 'function') tx = ctx.getRegexedString(tx, isU ? 1 : 2, { depth: arr.length - ix - 1, isPrompt: true }); } catch (e) { /* ignore */ }
+                return `${pre}${tx}${suf}`;
+            }).join(sep);
+        };
+        const prevBlock = (it) => {
+            const nm = it.block_name; if (!nm) return '';
+            const cnt = it.block_count > 0 ? it.block_count : 1;
+            const re = new RegExp('<' + esc(nm) + '(?:\\s[^>]*)?>[\\s\\S]*?<\\/' + esc(nm) + '\\s*>', 'i');
+            const found = [];
+            for (let i = msgId - 1; i >= 0 && found.length < cnt; i--) {
+                const eb = chat[i] && chat[i].extra && chat[i].extra.extblocks; if (!eb) continue;
+                const m = String(eb).match(re); if (m) found.push(m[0]);
+            }
+            return found.reverse().join('\n\n');
+        };
+        const parts = []; const kinds = [];
+        // как у ExtBlocks (getBlocksFullPrompt): в начале запроса «Block prompt» и «Block template» из вкладки Block Settings
+        const bp = String(sub(b.block.prompt || '')).trim(), bt = String(sub(b.block.template || '')).trim();
+        if (bp) { parts.push('Block prompt:\n' + bp); kinds.push('text'); out.items.push(`prompt:${bp.length}`); }
+        if (bt) { parts.push('Block template:\n' + bt); kinds.push('text'); out.items.push(`template:${bt.length}`); }
+        for (const it of b.block.context) {
+            if (!it || it.disabled) continue;
+            let c = '';
+            try {
+                if (it.type === 'text') c = sub(it.text);
+                else if (it.type === 'last_messages' || it.type === 'last_messages_keyword') c = lastMessages(it);
+                else if (it.type === 'previous_block') c = prevBlock(it);
+            } catch (e) { dbg('block-ctx-err', { type: it.type, e: String(e && e.message || e) }); }
+            c = String(c || '').trim(); if (!c) continue;
+            if (it.type === 'text') { const am = c.match(/^\s*\[APPEARANCE:\s*([^\]]+?)\s*\]\s*([\s\S]*)$/i); if (am && am[2].trim()) out.appearances.push({ name: am[1].trim(), tags: am[2].replace(/\s*\n\s*/g, ' ').trim() }); }
+            out.items.push(`${it.type}:${c.length}`);
+            parts.push(c); kinds.push(it.type);
+        }
+        // бюджет: инструкции и описания персонажей (text) — ЦЕЛИКОМ; чат и прошлые блоки ужимаем (оставляя САМОЕ СВЕЖЕЕ — конец), а не режем хвост всего
+        const BUDGET = 48000;
+        let total = parts.reduce((s, x) => s + x.length, 0) + (parts.length - 1) * 2;
+        if (total > BUDGET) {
+            const flexIdx = kinds.map((k, i) => (k === 'text' ? -1 : i)).filter(i => i >= 0);
+            const fixed = total - flexIdx.reduce((s, i) => s + parts[i].length, 0);
+            const room = Math.max(0, BUDGET - fixed);
+            const flexSum = flexIdx.reduce((s, i) => s + parts[i].length, 0) || 1;
+            flexIdx.forEach(i => { const lim = Math.max(800, Math.floor(room * parts[i].length / flexSum)); if (parts[i].length > lim) parts[i] = '…' + parts[i].slice(-lim); });
+            total = parts.reduce((s, x) => s + x.length, 0) + (parts.length - 1) * 2;
+        }
+        out.text = parts.join('\n\n').slice(0, 56000);
+        return out;
+    }
+    function extBlockPromptText(name) {
+        if (!name) return '';
+        const b = extBlocksList().find(x => x.name === name); if (!b || !Array.isArray(b.block.context)) return '';
+        const ctx = getCtx(); const parts = [];
+        for (const it of b.block.context) {
+            if (!it || it.disabled || it.type !== 'text' || !it.text) continue;
+            let tx = String(it.text);
+            try { if (typeof ctx.substituteParams === 'function') tx = ctx.substituteParams(tx); } catch (e) { /* ignore */ }
+            parts.push(tx.trim());
+        }
+        return parts.join('\n\n').slice(0, 24000);
+    }
     function isSpriteOn() { return getSettings().spritePos !== 'off'; }
 
     // ╔════════════════════════════════════════════════════════════════╗
@@ -778,7 +1073,7 @@ ${roster}
     function getMesEl(id) { return document.querySelector(`#chat .mes[mesid="${id}"]`); }
     function normalizeSrc(src) {
         if (!src) return null;
-        if (src.includes('[IMG:') || src.includes('[VID:') || src.includes('error.svg')) return null;
+        if (src.includes('[IMG:') || src.includes('[VID:') || src.includes('error.svg') || src === SEQ_WAIT) return null;
         return src;
     }
     function resolveImageUrls(id, slotCount) {
@@ -988,6 +1283,7 @@ ${roster}
     <button class="svn-ib" data-act="hide" title="Скрыть/показать диалог"><i class="fa-solid fa-eye"></i></button>
     <button class="svn-ib" data-act="log" title="История реплик (бэклог)"><i class="fa-solid fa-clock-rotate-left"></i></button>
     <button class="svn-ib" data-act="gallery" title="Галерея кадров"><i class="fa-solid fa-images"></i></button>
+    <button class="svn-ib" data-act="queue" title="Очередь генерации кадров"><i class="fa-solid fa-list-check"></i></button>
     <button class="svn-ib" data-act="music" title="Музыка / плейлист"><i class="fa-solid fa-music"></i></button>
     <button class="svn-ib" data-act="rotate" title="Повернуть в горизонталь (телефон)"><i class="fa-solid fa-mobile-screen-button"></i></button>
     <button class="svn-ib" data-act="prev-turn" title="Предыдущая сцена"><i class="fa-solid fa-backward-step"></i></button>
@@ -1128,6 +1424,15 @@ ${roster}
 <div class="svn-sheet svn-gallery-sheet" id="svn-gallery">
   <div class="svn-sheet-head"><span><i class="fa-solid fa-images"></i> Галерея кадров</span><button class="svn-ib" data-gal="close"><i class="fa-solid fa-xmark"></i></button></div>
   <div class="svn-gallery-grid" id="svn-gallery-grid"></div>
+</div>
+<div class="svn-sheet svn-queue-sheet" id="svn-queue">
+  <div class="svn-sheet-head"><span><i class="fa-solid fa-list-check"></i> Очередь кадров</span><button class="svn-ib" data-q="close"><i class="fa-solid fa-xmark"></i></button></div>
+  <div class="svn-q-tools">
+    <button class="svn-set-btn" data-q="refresh"><i class="fa-solid fa-arrows-rotate"></i> Обновить</button>
+    <button class="svn-set-btn" data-q="failed"><i class="fa-solid fa-triangle-exclamation"></i> Заново все упавшие</button>
+  </div>
+  <div class="svn-q-sum" id="svn-queue-sum"></div>
+  <div class="svn-queue-list" id="svn-queue-list"></div>
 </div>`;
         document.body.appendChild(ov);
         player.el = ov;
@@ -1299,7 +1604,7 @@ ${roster}
             ({
                 prev, next, auto: toggleAuto, skip: skipSeen, regen: regenCurrent, save: saveCurrent,
                 settings: toggleSettings, hide: toggleDialog, cast: toggleCastPanel, rotate: toggleRotate,
-                log: toggleBacklog, music: openBgmSheet, gallery: toggleGallery,
+                log: toggleBacklog, music: openBgmSheet, gallery: toggleGallery, queue: toggleQueue,
                 collapse: () => setCtrlCollapsed(!getSettings().ctrlCollapsed),
                 'prev-turn': () => gotoTurn(-1), 'next-turn': () => gotoTurn(1), close: closePlayer,
             }[act] || (() => {}))();
@@ -1380,6 +1685,22 @@ ${roster}
             const galGrid = galSheet.querySelector('#svn-gallery-grid');
             if (galGrid) galGrid.addEventListener('click', e => { const it = e.target.closest('.svn-gal-item'); if (it) galleryJump(+it.dataset.mes, +it.dataset.slot); });
         }
+        // лист «Очередь кадров»
+        const qSheet = ov.querySelector('#svn-queue');
+        if (qSheet) {
+            qSheet.addEventListener('click', e => {
+                e.stopPropagation();
+                if (e.target === qSheet) { closeQueue(); return; }
+                const b = e.target.closest('[data-q]'); if (!b) return;
+                const act = b.dataset.q, slot = Number(b.dataset.slot);
+                if (act === 'close') closeQueue();
+                else if (act === 'refresh') { _queueSig = ''; renderQueue(); }
+                else if (act === 'regen') enqueueRegen(player.mesId, slot);
+                else if (act === 'cancel') cancelRegen(player.mesId, slot);
+                else if (act === 'failed') collectQueue(player.mesId).filter(x => x.state === 'err').forEach(x => enqueueRegen(player.mesId, x.i));
+                else if (act === 'goto') queueJump(slot);
+            });
+        }
         // менеджер спрайтов
         wireCastManager(ov);
         // тумблер «свернуть панели модулей» (чтобы спрятать весь HUD)
@@ -1456,6 +1777,7 @@ ${roster}
             player.el.querySelector('#svn-bgm').classList.remove('svn-show');        // музыка продолжает играть, лист просто закрыт
             player.el.querySelector('#svn-backlog').classList.remove('svn-show');
             player.el.querySelector('#svn-gallery').classList.remove('svn-show');
+            closeQueue();
             player.el.querySelectorAll('.svn-bg-layer').forEach(l => { l.classList.remove('svn-on'); l.dataset.url = ''; });
             const sp = player.el.querySelector('#svn-sprites'); if (sp) sp.innerHTML = '';
             const pn = player.el.querySelector('#svn-panels-list'); if (pn) pn.innerHTML = '';
@@ -2233,6 +2555,7 @@ ${roster}
     }
 
     function toggleSettings() {
+        closeQueue();
         const set = player.el.querySelector('#svn-settings');
         player.el.querySelector('#svn-cast-panel').classList.remove('svn-show');
         set.classList.toggle('svn-show');
@@ -2770,14 +3093,27 @@ ${roster}
     }
 
     function onCharMessageRendered(id) {
+        // ПЕРВЫМ делом (наш обработчик стоит раньше расширения картинок — оно подписано через makeLast): кодируем пробелы в путях готовых
+        // картинок, иначе оно режет путь по пробелу, считает файл несуществующим и перегенерирует готовые кадры. См. fixSpacedSrcs.
+        try {
+            const m0 = (getCtx().chat || [])[id];
+            if (m0 && !m0.is_user && getSettings().fixSpacedPaths !== false && prepForImageExt(m0)) {
+                dbg('fix-spaces', { id, why: 'перед проходом расширения картинок' });
+                try { getCtx().saveChat && getCtx().saveChat(); } catch (e) { /* ignore */ }
+            }
+        } catch (e) { /* ignore */ }
         const s = getSettings(); if (!s.enabled) return;
         if (_selfEmit.has(id)) return; // это наш повторный эмит ради генерации картинок — режиссёра/плеер уже отработали
         const mes = getMesEl(id); if (mes) mes.classList.remove('svn-streaming'); // стрим завершён
         const msg = (getCtx().chat || [])[id];
         // РЕЖИССЁР: свежий ответ основного ИИ без своих тегов картинок → мини-ИИ сам ставит N кадров + статус.
         //   (Старые/уже отрежиссированные сообщения имеют сохранённые теги → hasImageTags=true → сюда не попадут.)
+        if (msg && !msg.is_user) {
+            let hi = null, tu = null; try { hi = hasImageTags(msgSource(msg)); tu = topUpHave(msg); } catch (e) { /* ignore */ }
+            dbg('rendered', { id, swipe: msg.swipe_id || 0, directorActive: directorActive(), done: _directorDone.get(id), busy: _directorBusy.has(id), hasImgs: hi, topUpHave: tu, extblocksLen: ((msg.extra && msg.extra.extblocks) || '').length });
+        }
         if (msg && !msg.is_user && directorActive() && _directorDone.get(id) !== (msg.swipe_id || 0)
-            && !_directorBusy.has(id) && !hasImageTags(msgSource(msg))) {
+            && !_directorBusy.has(id) && (!hasImageTags(msgSource(msg)) || topUpHave(msg) >= 0)) {
             runDirector(id); // async; внутри сам вызовет afterDirector (карточка/плеер/модули)
             return;
         }
@@ -2940,10 +3276,28 @@ ${roster}
         <label class="checkbox_label"><input type="checkbox" id="svn_detectany" ${s.detectAnyImages !== false ? 'checked' : ''}><span>Распознавать картинки в любой обёртке (не только &lt;vn&gt;)</span></label>
         <label class="checkbox_label"><input type="checkbox" id="svn_extblocks" ${s.extBlocksImages !== false ? 'checked' : ''}><span>Внешние блоки (ExtBlocks) для картинок</span></label>
         <small class="svn-cfg-note indent">Картинки идут во внешние блоки (<code>extra.extblocks</code>), а не в текст — пост остаётся чистым. Включи в расширении картинок «Process external blocks». Подхватывает и блоки от других расширений.</small>
+        <div class="flex-row"><label for="svn_dirblock">Промпт кадров из блока ExtBlocks</label><select id="svn_dirblock" class="text_pole" style="width:auto;max-width:58%;"></select></div>
+        <small id="svn_dirblock_hint" class="svn-cfg-note indent"></small>
+        <details><summary>Замок внешности (теги дословно)</summary>
+          <textarea id="svn_applock" class="text_pole" rows="5" style="margin-top:6px;width:100%;" placeholder="Сора|Sora|Sorabella = adult, gorgeous face, ...">${escapeHtml(s.appearanceLock || '')}</textarea>
+          <small class="svn-cfg-note">Строки «Имя|Алиас = теги». Режиссёр пишет [[Имя]], расширение подставляет теги целиком, без сокращений. Необязательно: по умолчанию расширение само берёт внешность ВСЕХ персонажей из секций [APPEARANCE: …] блока (персона и текущий персонаж любого чата) и из строк «Вот так рисуй …:». Сюда пиши только то, что нужно переопределить.</small>
+        </details>
+        <label class="checkbox_label"><input type="checkbox" id="svn_dirapi" ${s.directorViaExtBlocks !== false ? 'checked' : ''}><span>Писать промпты кадров через API этого блока <small style="opacity:.6;">— его пресет (big/medium/small) и профиль подключения из ExtBlocks, а не «мини-ИИ»</small></span></label>
+        <small id="svn_dirapi_hint" class="svn-cfg-note indent"></small>
         <label class="checkbox_label"><input type="checkbox" id="svn_inject" ${s.injectPrompt !== false ? 'checked' : ''}><span>Инжектить наш VN-промпт (выключи, если весь промпт у тебя свой)</span></label>
         <details><summary>Своё распознавание (regex, для редких расширений)</summary>
           <input type="text" id="svn_imgdetect" class="text_pole" style="margin-top:6px;width:100%;" placeholder="свой regex (пусто = авто)" value="${escapeHtml(s.imgDetect || '')}">
           <small class="svn-cfg-note">JS-regex без флагов, должен матчить тег картинки целиком. Пример: &lt;pic&gt;[\\s\\S]*?&lt;/pic&gt;. Перебивает авто-распознавание.</small>
+        </details>
+        <details><summary>Отладка (лог для разбора проблем)</summary>
+          <small class="svn-cfg-note">Лог копится сам. Если что-то не работает — нажми «Скопировать лог» и пришли мне.</small>
+          <div class="flex-row" style="border-bottom:none;gap:6px;flex-wrap:wrap;">
+            <input type="button" id="svn_dbg_copy" class="menu_button" value="Скопировать лог">
+            <input type="button" id="svn_dbg_show" class="menu_button" value="Показать / скрыть">
+            <input type="button" id="svn_dbg_snap" class="menu_button" value="Снимок последнего ответа">
+            <input type="button" id="svn_dbg_clear" class="menu_button" value="Очистить">
+          </div>
+          <textarea id="svn_dbg_ta" class="text_pole" readonly rows="12" style="display:none;width:100%;font-size:11px;font-family:monospace;"></textarea>
         </details>
       </div>
 
@@ -3058,6 +3412,53 @@ ${roster}
             }
         });
         bind('#svn_inject', 'change', e => { s.injectPrompt = e.target.checked; saveSettings(); updateInjection(); toastr && toastr.info(e.target.checked ? 'Наш VN-промпт включён' : 'Наш VN-промпт выключен — правит твой промпт', 'Визуальная новелла'); });
+        // промпт кадров из блока ExtBlocks (сам блок в ExtBlocks держим выключенным — тогда он не генерит свою одну картинку)
+        const dirSel = wrap.querySelector('#svn_dirblock'), dirHint = wrap.querySelector('#svn_dirblock_hint');
+        const syncApiHint = () => {
+            const h = wrap.querySelector('#svn_dirapi_hint'); if (!h) return;
+            const name = s.directorBlock || '';
+            if (!name) { h.textContent = ''; return; }
+            if (s.directorViaExtBlocks === false) { h.textContent = 'Промпты пишет «мини-ИИ» расширения (настройки Режиссёра).'; return; }
+            const info = extBlocksApiInfo(name);
+            h.textContent = info ? `Пишет: пресет «${info.presetName}» → профиль «${info.profile.name}» (${info.profile.model || 'модель по умолчанию'}, ${info.source}).` : '⚠ В ExtBlocks не найдены профили подключения — будет «мини-ИИ».';
+        };
+        const syncDirHint = () => {
+            syncApiHint();
+            const name = s.directorBlock || '';
+            if (!name) { dirHint.textContent = 'Не выбран: режиссёр пишет промпты кадров сам. Выбери блок (например nai_imagen) — режиссёр возьмёт его инструкцию/описания персонажей как образец для КАЖДОГО кадра.'; return; }
+            const b = extBlocksList().find(x => x.name === name);
+            if (!b) { dirHint.textContent = '⚠ Блок не найден в ExtBlocks (другой набор или персонаж?).'; return; }
+            dirHint.textContent = b.disabled
+                ? 'Блок выключен в ExtBlocks — так и надо: сам он не сработает, а режиссёр прочитает его целиком (инструкцию, описания персонажей, последние сообщения, прошлые блоки) и опишет внешность как в нём.'
+                : '⚠ Этот блок ВКЛЮЧЁН в ExtBlocks — он по-прежнему сам сгенерит одну картинку. Выключи его там (тумблер справа у блока).';
+        };
+        const fillDirSel = () => {
+            const list = extBlocksList(); const cur = s.directorBlock || '';
+            dirSel.innerHTML = '';
+            const add = (v, txt) => { const o = document.createElement('option'); o.value = v; o.textContent = txt; dirSel.appendChild(o); };
+            add('', '— не использовать —');
+            list.forEach(b => add(b.name, b.name + (b.disabled ? '' : '  (включён!)')));
+            if (cur && !list.some(b => b.name === cur)) add(cur, cur + ' (не найден)');
+            dirSel.value = cur; syncDirHint();
+        };
+        fillDirSel();
+        bind('#svn_applock', 'input', e => { s.appearanceLock = e.target.value; saveSettings(); });
+        bind('#svn_dirapi', 'change', e => { s.directorViaExtBlocks = e.target.checked; saveSettings(); syncApiHint(); dbg('settings', { directorViaExtBlocks: s.directorViaExtBlocks }); });
+        dirSel.addEventListener('focus', fillDirSel);
+        dirSel.addEventListener('change', e => { s.directorBlock = e.target.value; saveSettings(); syncDirHint(); dbg('settings', { directorBlock: s.directorBlock }); });
+        // отладка
+        const dbgTa = wrap.querySelector('#svn_dbg_ta');
+        const dbgRefresh = () => { if (dbgTa.style.display === 'none') return; dbgTa.value = dbgText(); dbgTa.scrollTop = dbgTa.scrollHeight; };
+        bind('#svn_dbg_show', 'click', () => { dbgTa.style.display = (dbgTa.style.display === 'none') ? '' : 'none'; dbgRefresh(); });
+        bind('#svn_dbg_copy', 'click', async () => {
+            const txt = dbgText(); let ok = false;
+            try { await navigator.clipboard.writeText(txt); ok = true; } catch (e) {
+                try { dbgTa.style.display = ''; dbgTa.value = txt; dbgTa.focus(); dbgTa.select(); ok = document.execCommand('copy'); } catch (e2) { /* ignore */ }
+            }
+            toastr && (ok ? toastr.success('Лог скопирован — вставь его мне', 'Визуальная новелла') : toastr.info('Не вышло скопировать сам — текст показан ниже, выдели всё и скопируй', 'Визуальная новелла'));
+        });
+        bind('#svn_dbg_snap', 'click', () => { const ch = getCtx().chat || []; for (let i = ch.length - 1; i >= 0; i--) if (!ch[i].is_user) { dbgSnapshot(i, 'manual'); break; } dbgRefresh(); });
+        bind('#svn_dbg_clear', 'click', () => { _dbg.length = 0; dbgRefresh(); });
         const imgfmtSel = wrap.querySelector('#svn_imgformat'); imgfmtSel.value = s.imgFormat || 'iig';
         const imgHint = wrap.querySelector('#svn_imgformat_hint');
         const syncImgHint = () => {
@@ -3294,12 +3695,12 @@ ${roster}
         const schema = (json && typeof json === 'object') ? json : undefined; // boolean json => без схемы, парсим вольно
         if (typeof ctx.generateRaw === 'function') {
             try { return await ctx.generateRaw({ prompt: user || '...', systemPrompt: system, responseLength: maxTokens, jsonSchema: schema }); }
-            catch (e) { /* пробуем quiet */ }
+            catch (e) { dbg('lite-raw-fail', String(e && e.message || e)); /* пробуем quiet */ }
         }
         if (typeof ctx.generateQuietPrompt === 'function') {
             const q = (system ? system + '\n\n' : '') + (user || '');
             try { return await ctx.generateQuietPrompt({ quietPrompt: q, responseLength: maxTokens, jsonSchema: schema }); }
-            catch (e) { return await ctx.generateQuietPrompt(q, false, false); }
+            catch (e) { dbg('lite-quiet-fail', String(e && e.message || e)); return await ctx.generateQuietPrompt(q, false, false); }
         }
         throw new Error('В этой версии SillyTavern нет доступной генерации (generateRaw/generateQuietPrompt)');
     }
@@ -3673,7 +4074,11 @@ ${fields.join('\n')}
     // режим внешних блоков для картинок режиссёра: теги уходят в extra.extblocks, в .mes — плейсхолдеры.
     // только для формата iig (его читает/пишет расширение картинок в extblocks); 'image' остаётся inline.
     const IMG_PLACEHOLDER = '<!--svn-img-->';
-    const SEQ_WAIT = '[IMG:WAIT]'; // маркер «кадр в очереди на генерацию» (см. блок ПОСЛЕДОВАТЕЛЬНАЯ ГЕНЕРАЦИЯ КАДРОВ)
+    // маркер «кадр в очереди на генерацию» (см. блок ПОСЛЕДОВАТЕЛЬНАЯ ГЕНЕРАЦИЯ КАДРОВ).
+    // НЕЛЬЗЯ '[IMG:WAIT]': расширение картинок (sillywardrobe 3.0) считает любой src с '[IMG:' командой «генерируй» и запускает ВСЕ теги разом.
+    // Прозрачный 1×1 GIF оно пропускает (не путь, не маркер, не пусто) и не ходит за ним в сеть.
+    const SEQ_WAIT = 'data:image/gif;base64,R0lGODlhAQABAAAAACw=';
+    const SEQ_WAIT_OLD = '[IMG:WAIT]'; // старые сообщения из прошлых версий
     function directorToBlocks() {
         const s = getSettings();
         return s.extBlocksImages !== false && (s.imgFormat || 'iig') === 'iig';
@@ -3779,6 +4184,40 @@ ${fields.join('\n')}
         if (moduleEnabled('journal')) { put('goal', pick('goal', 'цель', 'цели')); put('flag', pick('flag', 'флаг', 'событие')); }
         return lines.join('\n');
     }
+
+    // ── ЗАМОК ВНЕШНОСТИ: теги внешности подставляет КОД дословно, а не модель (модели их сокращают) ──
+    function parseAppearanceLock(blkText, appearances) {
+        const list = [];
+        const raw = String(getSettings().appearanceLock || '');
+        raw.split('\n').forEach(line => {
+            const m = line.match(/^\s*([^=]+?)\s*=\s*([\s\S]+?)\s*$/); if (!m) return;
+            const names = m[1].split('|').map(x => x.trim()).filter(Boolean); if (names.length && m[2]) list.push({ names, tags: m[2].replace(/\s*\n\s*/g, ' ') });
+        });
+        if (!list.length && blkText) { // авто: из блока берём «Вот так рисуй X или Y: теги»
+            const m = String(blkText).match(/Вот так рисуй\s+([^:\n]+?)\s*:\s*([\s\S]*?)(?:\n\s*\n|$)/i);
+            if (m) {
+                const names = m[1].split(/\s+или\s+|,/i).map(x => x.trim()).filter(Boolean).concat(['Sora', 'Sorabella', 'Sofia', 'Sophia']);
+                list.push({ names, tags: m[2].replace(/\s*\n\s*/g, ' ').trim() });
+            }
+        }
+        // авто для ЛЮБЫХ персонажей: секции [APPEARANCE: Имя] блока (персона + текущий персонаж чата), если описание не слишком длинное (иначе это лор, не теги)
+        const ctx = getCtx();
+        (appearances || []).forEach(a => {
+            if (!a.name || a.tags.length > 1400) return;
+            const names = [a.name, ctx.name1, ctx.name2].filter(Boolean).filter(n => n === a.name || a.name.toLowerCase().indexOf(String(n).toLowerCase()) >= 0);
+            if (list.some(l => l.names.some(n => n.toLowerCase() === a.name.toLowerCase()))) return;
+            list.push({ names: Array.from(new Set(names)), tags: a.tags });
+        });
+        return list;
+    }
+    function expandAppearance(frames, lock) {
+        if (!lock.length || !Array.isArray(frames)) return frames;
+        const norm = x => String(x).toLowerCase();
+        return frames.map(f => String(f == null ? '' : f).replace(/\[\[\s*([^\]]+?)\s*\]\]/g, (all, nm) => {
+            const e = lock.find(l => l.names.some(n => norm(n) === norm(nm)));
+            return e ? e.tags : all;
+        }));
+    }
     // ОДИН вызов мини-ИИ: разбивает сцену на кадры + заполняет статус + (опц.) спрайты/плейлист
     async function directorAsk(id, mn, mx) {
         const ctx = getCtx();
@@ -3800,10 +4239,17 @@ ${fields.join('\n')}
         const wantPlaylist = moduleEnabled('bgm') && moduleCfg('bgm').auto !== false && bgmGap > 0;
         const plCount = Math.max(1, Math.min(8, bgmGap)); // за один ход добираем не больше 8 (чтобы JSON не пух)
         let n = 1;
-        const sys =
+        let sys =
 `Ты — режиссёр визуальной новеллы. Тебе дают ГОТОВУЮ реплику ролевого ИИ — ты НЕ переписываешь её, а оформляешь как сцену:
-1) СНАЧАЛА заполни массив "frames": разбей сцену на ${want} кадров-картинок — это ОБЯЗАТЕЛЬНО, ровно столько строк в массиве, не меньше и не больше. К каждому кадру — ОТДЕЛЬНЫЙ промпт НА АНГЛИЙСКОМ (60–110 слов): что и кто в кадре, поза и эмоция, ракурс, свет, окружение, атмосфера, стиль рисовки. Внешность КАЖДОГО персонажа держи КОНСИСТЕНТНОЙ. Первый кадр — общий план-фон сцены, дальше — ключевые моменты по ходу текста до самого конца реплики (последний кадр — по финалу сцены).
+1) СНАЧАЛА заполни массив "frames": разбей сцену на ${want} кадров-картинок — это ОБЯЗАТЕЛЬНО, ровно столько строк в массиве, не меньше и не больше. К каждому кадру — ОТДЕЛЬНЫЙ промпт НА АНГЛИЙСКОМ (${getSettings().directorBlock ? 'длина и структура — как в инструкции блока ниже, она важнее любых лимитов тут; НЕ сокращай' : '60–110 слов'}): что и кто в кадре, поза и эмоция, ракурс, свет, окружение, атмосфера, стиль рисовки. Внешность КАЖДОГО персонажа держи КОНСИСТЕНТНОЙ. Первый кадр — общий план-фон сцены, дальше — ключевые моменты по ходу текста до самого конца реплики (последний кадр — по финалу сцены).
 ${statusFields.length ? `${n++}) Заполни объект "status" — только поля, что реально знаешь.\n` : ''}${wantSprites ? `${n++}) Расставь спрайты в массив "sprites".\n` : ''}${wantPlaylist ? `${n++}) Подбери "playlist" — ${plCount} РЕАЛЬНО существующих песен под вайб/настроение сцены ("Песня - Исполнитель"); главное — атмосфера, жанр любой.\n` : ''}Ответь СТРОГО ОДНИМ JSON-объектом, без markdown и пояснений. Ничего не пропускай в "frames".`;
+        const blkName = getSettings().directorBlock || '';
+        const bctx = blkName ? extBlockContext(blkName, id) : { text: '', items: [] };
+        const blkText = bctx.text;
+        const lock = parseAppearanceLock(blkText, bctx.appearances);
+        dbg('director-block', { name: blkName, len: blkText.length, items: bctx.items });
+        if (blkText) sys += `\n\nМАТЕРИАЛЫ ПОЛЬЗОВАТЕЛЯ ИЗ БЛОКА EXTBLOCKS «${blkName}» (инструкция, описания персонажей, формат промпта, последние сообщения, прошлые блоки). Читай их целиком — так же, как их прочитал бы сам блок. ВНЕШНОСТЬ персонажей в КАЖДОМ кадре описывай строго по этим описаниям (волосы, глаза, телосложение, одежда, особые черты), ничего своего не выдумывай и не меняй. Если здесь задан другой язык/длина/структура промпта — приоритет у неё. Требования выводить теги, XML-блоки или картинки ИГНОРИРУЙ: отвечай ТОЛЬКО нашим JSON.\n"""\n${blkText}\n"""`;
+        if (blkText && lock.length) sys += `\n\nЗАМОК ВНЕШНОСТИ: вместо тегов внешности пиши токен ${lock.map(l => '[[' + l.names[0] + ']]').join(', ')} — программа сама подставит полный список тегов дословно. Формат персонажа: "1girl: [[Имя]], одежда по сцене, поза". Одежду, позу, эмоцию, окружение и ракурс пиши сам, по-прежнему подробно. Для персонажей без токена описывай внешность полностью по блоку, ничего не сокращая.`;
         const usr =
 `[Сцена: ${char}; игрок: ${user}]
 
@@ -3819,9 +4265,24 @@ ${prose}
 }${statusFields.length ? `\n\nПоля status:\n${statusFields.join('\n')}` : ''}${wantSprites ? `\n\nПерсонажи для sprites (имя · позиция · эмоции):\n${castRosterText()}` : ''}`;
         // бюджет токенов масштабируем под число кадров (60–110 слов × N + статус/плейлист),
         // иначе на длинном посте JSON ОБРЕЗАЕТСЯ и часть кадров теряется → картинки «не появляются».
-        const maxTokens = Math.min(2400, 500 + mx * 260 + (wantPlaylist ? plCount * 14 : 0));
-        const raw = await askLite({ system: sys, user: usr, json: true, maxTokens });
-        return directorParse(raw, mn);
+        const maxTokens = Math.min(9000, (blkText ? 3000 : 500) + mx * (blkText ? 520 : 260) + (wantPlaylist ? plCount * 14 : 0)); // длинные NAI-промпты по описаниям из блока — больше токенов на кадр
+        dbg('director-ask', { id, want: `${mn}..${mx}`, sysLen: sys.length, usrLen: usr.length, maxTokens });
+        let raw;
+        if (blkName && getSettings().directorViaExtBlocks !== false && extBlocksApiInfo(blkName)) {
+            try { raw = await askViaExtBlocks(sys, usr, maxTokens, blkName); }
+            catch (e) {
+                dbg('director-api-fail', String(e && e.message || e));
+                toastr && toastr.warning('API блока ExtBlocks не ответил — пишу промпты через мини-ИИ: ' + String(e && e.message || e).slice(0, 120), 'Визуальная новелла');
+                raw = await askLite({ system: sys, user: usr, json: true, maxTokens });
+            }
+        } else {
+            if (blkName && getSettings().directorViaExtBlocks !== false) dbg('director-api', { via: 'lite', why: 'у ExtBlocks нет профилей подключения' });
+            raw = await askLite({ system: sys, user: usr, json: true, maxTokens });
+        }
+        dbg('director-raw', { len: String(raw || '').length, head: String(raw || '').slice(0, 240) });
+        const parsed = directorParse(raw, mn);
+        if (lock.length && parsed && Array.isArray(parsed.frames)) { parsed.frames = expandAppearance(parsed.frames, lock); dbg('appearance-lock', { n: lock.length, names: lock.map(l => l.names[0]), tagsLen: lock.map(l => l.tags.length) }); }
+        return parsed;
     }
     // разбор ответа режиссёра + СПАСЕНИЕ кадров из обрезанного/кривого JSON (ключевое для длинных постов):
     // даже если ответ оборвался на "status"/"playlist", вытащим строки из массива "frames".
@@ -3838,12 +4299,12 @@ ${prose}
         return data;
     }
     // применить результат режиссёра к сообщению: вписать кадры/спрайты/<vn-status>, перерисовать, запустить генерацию
-    function applyDirectorResult(id, prompts, data) {
+    function applyDirectorResult(id, prompts, data, have) {
         const ctx = getCtx();
         const msg = (ctx.chat || [])[id]; if (!msg) return;
         const original = msg.mes || '';
         const vb = extractVnBlock(original); let prose = (vb == null) ? original : vb;
-        prose = stripMeta(prose).replace(/<\/?vn>/gi, '');
+        prose = stripMeta(prose).replace(/<\/?vn>/gi, '').replace(/<!--svn-img-->/gi, ''); // старые плейсхолдеры кадров (повторная режиссура) не копим
         // <choices> (если основной ИИ его написал) идёт в КОНЦЕ — вынимаем, чтобы кадры не дробили его блок
         let choicesBlock = '';
         prose = prose.replace(/<choices\b[^>]*>[\s\S]*?<\/choices>/gi, (m) => { choicesBlock += (choicesBlock ? '\n' : '') + m; return ''; });
@@ -3881,14 +4342,18 @@ ${prose}
         try { if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(id, msg); } catch (e) { /* ignore */ }
         try { ctx.saveChat && ctx.saveChat(); } catch (e) { /* ignore */ }
         retriggerImageExtension(id, { noButton: seq }); // запустить генерацию вставленных кадров (в seq-режиме — только кнопки не жмём: она бы подняла и «ожидающие»)
-        if (seq) seqStart(id, prompts.length); // остальные кадры запускает очередь по одному
+        if (seq) seqStart(id, prompts.length, have || 0); // остальные кадры запускает очередь по одному
+        dbg('apply', { id, n: prompts.length, toBlocks, seq, have: have || 0, ebTail: String((msg.extra && msg.extra.extblocks) || '').slice(-160) });
+        dbgSnapshot(id, 'after-apply'); dbgSnapSoon(id, 'apply');
         afterDirector(id);           // показать карточку/плеер + прогнать модули-панели
     }
     // запустить генерацию вставленных кадров в расширении картинок
     function retriggerImageExtension(id, opts) {
+        try { const _m = (getCtx().chat || [])[id]; if (_m && prepForImageExt(_m)) dbg('fix-spaces', { id, why: 'перед повтором события' }); } catch (e) { /* ignore */ }
         const mes = getMesEl(id);
         // 1) хирургично: кнопка «перегенерировать картинки» расширения (megarakk/sillyimages) — без глобальных событий
         const btn = mes && (mes.querySelector('.iig-regenerate-btn') || mes.querySelector('.iig-regen-all-btn'));
+        dbg('retrigger', { id, btn: !!btn, noButton: !!(opts && opts.noButton), mesEl: !!mes });
         if (btn && !(opts && opts.noButton)) { try { btn.click(); return; } catch (e) { /* ignore */ } }
         // 2) обобщённо: повторно эмитим событие рендера — его слушает любое расширение картинок (megarakk = makeLast)
         const ctx = getCtx(); const E = ctx.event_types || {};
@@ -3897,7 +4362,21 @@ ${prose}
             // снимаем флаг по таймеру (а не по промису emit): генерация картинок в расширении может идти
             // десятки секунд, а наш собственный хэндлер отрабатывает синхронно в самом начале emit.
             setTimeout(() => _selfEmit.delete(id), 1500);
-            try { ctx.eventSource.emit(E.CHARACTER_MESSAGE_RENDERED, id); } catch (e) { _selfEmit.delete(id); }
+            // ВАЖНО: ExtBlocks на КАЖДЫЙ CHARACTER_MESSAGE_RENDERED сначала СТИРАЕТ extra.extblocks сообщения
+            // (handleCharTrigger → purgeBlocksExtra) и заново генерит свои блоки. Наше повторное событие сносило
+            // только что записанные кадры режиссёра (в логе: ebLen=0 сразу после apply). Поэтому на миг «выключаем»
+            // ExtBlocks: его обработчик стоит первым в очереди и проверяет флаг сразу при вызове.
+            const ebs = ctx.extensionSettings && ctx.extensionSettings.ExtBlocks;
+            const ebWasOn = !!(ebs && ebs.extblocks_is_enabled);
+            let ebBack = false;
+            const restoreEb = () => { if (ebBack) return; ebBack = true; if (ebWasOn && ebs) ebs.extblocks_is_enabled = true; };
+            if (ebWasOn) ebs.extblocks_is_enabled = false;
+            dbg('retrigger-emit', { id, ebGuard: ebWasOn });
+            try {
+                const pr = ctx.eventSource.emit(E.CHARACTER_MESSAGE_RENDERED, id);
+                setTimeout(restoreEb, 400); // не ждём конца генерации картинок — ExtBlocks не должен быть выключен надолго
+                if (pr && typeof pr.then === 'function') pr.then(restoreEb, restoreEb);
+            } catch (e) { _selfEmit.delete(id); restoreEb(); }
         }
     }
     // ╔════════════════════════════════════════════════════════════════╗
@@ -3975,12 +4454,13 @@ ${prose}
             seqStart(id, tags.length);
         } catch (e) { console.warn('[VN] seqHoldOnReceive', e); }
     }
-    function seqStart(id, n) {
+    function seqStart(id, n, off) {
         if (!(n > 1)) return;
         const msg = (getCtx().chat || [])[id]; if (!msg) return;
         const prev = _seqRuns.get(id); if (prev) prev.cancel = true;
-        const run = { id, n, k: 0, swipe: msg.swipe_id || 0, since: Date.now(), retried: false, cancel: false };
+        const run = { id, n, off: off || 0, k: 0, swipe: msg.swipe_id || 0, since: Date.now(), retried: false, cancel: false };
         _seqRuns.set(id, run);
+        dbg('seq-start', { id, n, off: off || 0 });
         setTimeout(() => seqTick(run), 1500);
     }
     // 'ready' | 'failed' | 'busy' для k-го кадра
@@ -4010,12 +4490,23 @@ ${prose}
         const ctx = getCtx();
         const msg = (ctx.chat || [])[run.id];
         if (!msg || (msg.swipe_id || 0) !== run.swipe) { _seqRuns.delete(run.id); return; }
-        const st = seqFrameState(run.id, run.k);
+        const st = seqFrameState(run.id, run.k + (run.off || 0));
+        try { const _m = (getCtx().chat || [])[run.id]; if (_m && prepForImageExt(_m)) dbg('fix-spaces', { id: run.id, why: 'очередь' }); } catch (e) { /* ignore */ }
         const timedOut = Date.now() - run.since > SEQ_FRAME_TIMEOUT_MS;
-        if (st === 'busy' && !timedOut) return again();
+        if (run.lastSt !== st + (timedOut ? '!' : '')) { run.lastSt = st + (timedOut ? '!' : ''); dbg('seq-tick', { id: run.id, k: run.k, off: run.off || 0, st, timedOut }); }
+        if (st === 'busy' && !timedOut) {
+            // кадр уже выпущен ([IMG:GEN]), а генерация не идёт: расширение картинок игнорирует событие, пока обрабатывает предыдущий кадр
+            // этого же сообщения. Повторяем событие раз в ~20 с (если оно уже генерит — оно просто пропустит наш «пинок»).
+            if (!frameQueued(run.id, run.k + (run.off || 0)) && (run.kicks || 0) < 8 && Date.now() - (run.kickAt || run.since) > 20000) {
+                run.kicks = (run.kicks || 0) + 1; run.kickAt = Date.now();
+                dbg('seq-kick', { id: run.id, k: run.k, kicks: run.kicks });
+                retriggerImageExtension(run.id, { noButton: true });
+            }
+            return again();
+        }
         if (st === 'failed' && !run.retried && !timedOut) {
             // одна попытка «Повторить» на кадр (ретраи самого расширения могут быть отключены/исчерпаны)
-            const btn = seqFindRegenBtn(getMesEl(run.id), run.k);
+            const btn = seqFindRegenBtn(getMesEl(run.id), run.k + (run.off || 0));
             if (btn) { run.retried = true; run.since = Date.now(); try { btn.click(); } catch (e) { /* ignore */ } return setTimeout(() => seqTick(run), 3000); }
         }
         // кадр k закончился (готов / упал окончательно / завис) → выпускаем следующий
@@ -4025,12 +4516,14 @@ ${prose}
             if (run.cancel) return;
             const m2 = (getCtx().chat || [])[run.id];
             if (!m2 || (m2.swipe_id || 0) !== run.swipe) { _seqRuns.delete(run.id); return; }
-            if (seqSetTag(m2, run.k, SEQ_WAIT, '[IMG:GEN]')) {
+            const _flip = seqSetTag(m2, run.k, SEQ_WAIT, '[IMG:GEN]');
+            dbg('seq-release', { id: run.id, k: run.k, flipped: _flip });
+            if (_flip) {
                 try { getCtx().updateMessageBlock && getCtx().updateMessageBlock(run.id, m2); } catch (e) { /* ignore */ }
                 try { getCtx().saveChat && getCtx().saveChat(); } catch (e) { /* ignore */ }
                 retriggerImageExtension(run.id, { noButton: true });
             }
-            run.since = Date.now();
+            run.since = Date.now(); run.kickAt = Date.now(); run.kicks = 0;
             again();
         }, SEQ_GAP_MS);
     }
@@ -4039,7 +4532,7 @@ ${prose}
         if (!(k >= 0)) return false;
         const msg = (getCtx().chat || [])[id]; if (!msg) return false;
         const tags = msgSource(msg).match(imgMarkRe('gi')) || [];
-        return !!(tags[k] && tags[k].indexOf(SEQ_WAIT) !== -1);
+        return !!(tags[k] && (tags[k].indexOf(SEQ_WAIT) !== -1 || tags[k].indexOf(SEQ_WAIT_OLD) !== -1));
     }
 
     // хвост обработки: карточка + (если ждали/автооткрытие) плеер + модули-панели
@@ -4068,31 +4561,69 @@ ${prose}
         const mesText = block.querySelector('.mes_text');
         if (mesText) mesText.insertAdjacentElement('afterend', card); else block.insertBefore(card, block.firstChild);
     }
+    function onExtBlocksRegenerated(id) {
+        const msg = (getCtx().chat || [])[id];
+        dbg('extb-regen', { id, enabled: getSettings().enabled, directorActive: directorActive(), busy: _directorBusy.has(id) });
+        if (!msg || msg.is_user || !getSettings().enabled || !directorActive()) return;
+        if (_directorBusy.has(id)) return;
+        _directorDone.delete(id); // текст ответа тот же, но блоки пересозданы — режиссёр должен отработать заново
+        seqCancelAll();           // старая очередь кадров относилась к стёртым блокам
+        if (!hasImageTags(msgSource(msg)) || topUpHave(msg) >= 0) runDirector(id);
+        else afterDirector(id);
+    }
+    // ExtBlocks (его слушатель стоит первым и ЖДЁТ конца своей генерации) успевает положить в extra.extblocks свои картинки —
+    // обычно один промпт. Если их меньше, чем «от» в настройках, режиссёр ДОБИРАЕТ недостающие. Возвращает, сколько картинок
+    // уже лежит (их оставляем как есть), либо -1 — добирать не надо (картинок хватает / они не из внешних блоков / режим выключен).
+    function topUpHave(msg) {
+        try {
+            const s = getSettings();
+            if (!msg || s.topUpExtFrames === false) return -1;
+            if (!directorToBlocks()) { if (blockImageTags(msg)) console.info('[VN] добор кадров выключен: нужен формат картинок «iig» и опция «Внешние блоки»'); return -1; }
+            const src = msgSource(msg);
+            const total = (src.match(imgMarkRe('gi')) || []).length;
+            const inBlocks = (blockImageTags(msg).match(imgMarkRe('gi')) || []).length;
+            const { mn } = frameRange();
+            const res = (inBlocks > 0 && inBlocks === total && total < mn) ? total : -1;
+            if (total > 0) dbg('topup-check', { total, inBlocks, mn, res });
+            return res;
+        } catch (e) { return -1; }
+    }
     async function runDirector(id) {
         const ctx = getCtx();
         const msg = (ctx.chat || [])[id];
         if (!msg || msg.is_user) return;
         const swipe = msg.swipe_id || 0;
         if (_directorDone.get(id) === swipe || _directorBusy.has(id)) return;
-        if (hasImageTags(msgSource(msg))) { _directorDone.set(id, swipe); afterDirector(id); return; } // уже есть свои картинки — не трогаем
+        const tu = topUpHave(msg);
+        if (hasImageTags(msgSource(msg)) && tu < 0) { dbg('director-skip', { id, reason: 'картинки уже есть и добор не нужен', tu }); _directorDone.set(id, swipe); afterDirector(id); return; } // уже есть свои картинки — не трогаем
+        const have = Math.max(tu, 0); // сколько картинок уже лежит во внешних блоках — режиссёр добирает до «от…до»
+        let stale = false; // пока режиссёр думал (30–60 с), пользователь успел свайпнуть/перегенерить ответ — результат относится к старому тексту
+        const swipeChanged = () => { const c = (getCtx().chat || [])[id]; return !c || (c.swipe_id || 0) !== swipe; };
         _directorBusy.add(id);
         markDirecting(id);
         try {
-            const { mn, mx } = frameRange();
+            const fr = frameRange();
+            const mn = Math.max(1, fr.mn - have), mx = Math.max(mn, fr.mx - have);
+            dbg('director-start', { id, swipe, have, askMin: mn, askMax: mx, block: getSettings().directorBlock || '' });
             let prompts = [];
             try {
                 const data = await directorAsk(id, mn, mx);
+                if (swipeChanged()) { stale = true; dbg('director-stale', { id, started: swipe, now: (((getCtx().chat || [])[id] || {}).swipe_id || 0) }); return; }
                 prompts = (data && Array.isArray(data.frames)) ? data.frames.map(f => (typeof f === 'string' ? f : (f && f.prompt) || '')) : [];
+                dbg('director-answer', { frames: prompts.length, firstLen: (prompts[0] || '').length, hasStatus: !!(data && data.status) });
                 prompts = enforceFrameCount(prompts, mn, mx, msg);
-                applyDirectorResult(id, prompts, data || {});
+                applyDirectorResult(id, prompts, data || {}, have);
                 directorSummary(data || {}, prompts.length); // показать, что реально вернул мини-ИИ (для проверки)
             } catch (e) {
                 console.warn('[VN] режиссёр (мини-ИИ) не ответил, ставлю кадры запасным способом:', e);
+                dbg('director-fail', String(e && e.message || e));
+                if (swipeChanged()) { stale = true; return; }
                 notifyLiteFail(e, 'Режиссёр не ответил — кадры ставлю из текста, но статус/музыка не заполнены. Проверь эндпоинт (кнопка «Проверить связь») или возьми модель поумнее / верни мини-ИИ на «таверну».');
-                applyDirectorResult(id, enforceFrameCount([], mx, mx, msg), {}); // эндпоинт мёртв — даём МАКС кадров из прозы (юзер хочет «много»), «функция точно работает» даже без лёгкого ИИ
+                applyDirectorResult(id, enforceFrameCount([], mx, mx, msg), {}, have); // эндпоинт мёртв — даём МАКС кадров из прозы (юзер хочет «много»), «функция точно работает» даже без лёгкого ИИ
             }
         } finally {
             _directorBusy.delete(id);
+            if (stale) setTimeout(() => { const m = (getCtx().chat || [])[id]; if (m && !m.is_user && _directorDone.get(id) !== (m.swipe_id || 0)) runDirector(id); }, 60);
         }
     }
 
@@ -4377,12 +4908,212 @@ ${prose}
         const ov = player.el; if (!ov) return; const sheet = ov.querySelector('#svn-gallery'); if (!sheet) return;
         const grid = sheet.querySelector('#svn-gallery-grid');
         const items = collectGallery();
-        grid.innerHTML = items.length
-            ? items.map(it => `<button class="svn-gal-item" data-mes="${it.mesId}" data-slot="${it.slot}" style="background-image:url('${cssUrl(it.url)}')"></button>`).join('')
-            : '<div class="svn-bgm-empty">Пока нет кадров — появятся по мере генерации картинок.</div>';
+        // Плитки строим через DOM, а не строкой HTML: URL с кавычками/скобками/&/пробелами
+        // ломал inline-style, и все плитки оставались пустыми.
+        grid.textContent = '';
+        if (!items.length) {
+            const empty = document.createElement('div'); empty.className = 'svn-bgm-empty';
+            empty.textContent = 'Пока нет кадров — появятся по мере генерации картинок.';
+            grid.appendChild(empty);
+        } else {
+            const frag = document.createDocumentFragment();
+            items.forEach(it => {
+                const b = document.createElement('button');
+                b.type = 'button'; b.className = 'svn-gal-item';
+                b.dataset.mes = String(it.mesId); b.dataset.slot = String(it.slot);
+                b.style.overflow = 'hidden'; b.style.position = 'relative'; b.style.display = 'none'; // покажем, когда картинка реально загрузится
+                // настоящий <img> вместо background-image: надёжнее, и видно, если файл не грузится
+                const im = document.createElement('img');
+                im.decoding = 'async'; im.alt = '';
+                im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;pointer-events:none;';
+                const base0 = isCssUrlString(it.url) ? String(it.url).replace(/^\s*url\(\s*(['"]?)([\s\S]*?)\1\s*\)\s*$/i, '$2') : String(it.url);
+                // варианты адреса: как есть → перекодированный путь → только имя файла закодировано
+                const tryList = [];
+                const addTry = u => { if (u && !tryList.includes(u)) tryList.push(u); };
+                addTry(base0);
+                try { addTry(encodeURI(decodeURI(base0))); } catch (_) { /* битая %-последовательность */ }
+                try { const i = base0.lastIndexOf('/'); if (i >= 0) addTry(base0.slice(0, i + 1) + encodeURIComponent(decodeURIComponent(base0.slice(i + 1)))); } catch (_) { /* ignore */ }
+                let ti = 0;
+                im.addEventListener('load', () => { b.style.display = ''; });
+                im.addEventListener('error', () => {
+                    if (++ti < tryList.length) { im.src = tryList[ti]; return; }
+                    // файла больше нет (пост выше с удалённой картинкой) — плитку не показываем
+                    b.remove();
+                    if (!grid.querySelector('.svn-gal-item') && !grid.querySelector('.svn-bgm-empty')) {
+                        const empty = document.createElement('div'); empty.className = 'svn-bgm-empty';
+                        empty.textContent = 'Пока нет кадров — появятся по мере генерации картинок.';
+                        grid.appendChild(empty);
+                    }
+                });
+                im.src = tryList[0];
+                b.appendChild(im);
+                frag.appendChild(b);
+            });
+            grid.appendChild(frag);
+        }
         sheet.classList.add('svn-show');
     }
     function closeGallery() { player.el && player.el.querySelector('#svn-gallery').classList.remove('svn-show'); }
+    // ╔════════════════════════════════════════════════════════════════╗
+    // ║  ОЧЕРЕДЬ КАДРОВ: что готово / генерируется / ждёт / упало и    ║
+    // ║  «отправить заново» по одному кадру (по одному за раз)         ║
+    // ╚════════════════════════════════════════════════════════════════╝
+    const _regenQ = [];            // ручные перегенерации: { id, k, swipe, state: 'wait' | 'run' }
+    let _regenBusy = false, _queueTimer = null, _queueSig = '';
+    const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+    function decodeEntities(s) { const ta = document.createElement('textarea'); ta.innerHTML = String(s || ''); return ta.value; }
+    // разбор одного <img …>: промпт и состояние по src
+    function tagInfo(tag) {
+        const m = String(tag || '').match(/data-iig-instruction\s*=\s*(["'])([\s\S]*?)\1/i);
+        let prompt = '';
+        if (m) {
+            const raw = decodeEntities(m[2]);
+            try { prompt = (JSON.parse(raw).prompt) || ''; } catch (e) { const pm = raw.match(/"prompt"\s*:\s*"([\s\S]*?)"\s*[,}]/); prompt = pm ? pm[1] : raw; }
+        }
+        const sm = String(tag || '').match(/\bsrc\s*=\s*(["'])([^"']*)\1/i); const src = sm ? sm[2] : '';
+        let st = 'url';
+        if (!src) st = 'none';
+        else if (src === SEQ_WAIT || src === SEQ_WAIT_OLD) st = 'wait';
+        else if (src.indexOf('[IMG:GEN]') !== -1) st = 'gen';
+        else if (src.indexOf('[IMG:ERROR') !== -1 || /\/error[123]?\.(?:svg|png|jpe?g|webp)(?:[?#]|$)/i.test(src)) st = 'err';
+        return { prompt: String(prompt), src, st };
+    }
+    function tagStateAt(msg, i) { const tags = msgSource(msg).match(imgMarkRe('gi')) || []; return tagInfo(tags[i] || '').st; }
+    // подменить src у i-го тега во всех местах, где сообщение его хранит (.mes / свайп / внешние блоки + копия в свайпе)
+    function setTagSrcAt(msg, i, to) {
+        let changed = false;
+        const total = (msgSource(msg).match(imgMarkRe('gi')) || []).length;
+        const put = (obj, key) => {
+            if (!obj || typeof obj[key] !== 'string') return;
+            const s = obj[key];
+            if ((s.match(imgMarkRe('gi')) || []).length !== total) return; // тегов в этом поле не столько, сколько в сообщении — индекс ненадёжен
+            const re = imgMarkRe('gi'); let n = -1, m;
+            while ((m = re.exec(s))) {
+                n++;
+                if (m[0].length === 0) { re.lastIndex++; continue; }
+                if (n === i) {
+                    const nt = m[0].replace(/(\bsrc\s*=\s*)(["'])[^"']*\2/i, (_, a) => `${a}"${to}"`);
+                    if (nt !== m[0]) { obj[key] = s.slice(0, m.index) + nt + s.slice(m.index + m[0].length); changed = true; }
+                    break;
+                }
+            }
+        };
+        const sw = msg.swipe_id;
+        put(msg, 'mes');
+        if (Array.isArray(msg.swipes) && sw != null) put(msg.swipes, sw);
+        put(msg.extra, 'extblocks');
+        if (sw != null && msg.swipe_info && msg.swipe_info[sw]) put(msg.swipe_info[sw].extra, 'extblocks');
+        return changed;
+    }
+    function collectQueue(id) {
+        const msg = (getCtx().chat || [])[id]; if (!msg) return [];
+        const tags = msgSource(msg).match(imgMarkRe('gi')) || [];
+        const run = _seqRuns.get(id);
+        return tags.map((tg, i) => {
+            const ti = tagInfo(tg);
+            const job = _regenQ.find(j => j.id === id && j.k === i);
+            return { i, state: ti.st === 'none' ? 'gen' : (ti.st === 'url' ? 'ready' : ti.st), prompt: ti.prompt, url: ti.st === 'url' ? ti.src : '', job: job ? job.state : '', current: !!(run && (run.k + (run.off || 0)) === i) };
+        });
+    }
+    function enqueueRegen(id, k) {
+        const msg = (getCtx().chat || [])[id]; if (!msg || !(k >= 0)) return false;
+        if (_regenQ.some(j => j.id === id && j.k === k)) return false;
+        _regenQ.push({ id, k, swipe: msg.swipe_id || 0, state: 'wait' });
+        dbg('regen-enqueue', { id, k, queue: _regenQ.length });
+        toastr && toastr.info(`Кадр ${k + 1} отправлен заново — встал в очередь`, 'Визуальная новелла');
+        _queueSig = ''; renderQueue();
+        pumpRegen();
+        return true;
+    }
+    function cancelRegen(id, k) {
+        const j = _regenQ.find(x => x.id === id && x.k === k);
+        if (j && j.state === 'wait') { _regenQ.splice(_regenQ.indexOf(j), 1); dbg('regen-cancel', { id, k }); }
+        _queueSig = ''; renderQueue();
+    }
+    async function pumpRegen() {
+        if (_regenBusy) return; _regenBusy = true;
+        try {
+            while (_regenQ.length) {
+                const job = _regenQ[0];
+                // сначала дожидаемся обычной очереди этого сообщения — генерируем строго по одному
+                let guard = 0; while (_seqRuns.has(job.id) && guard++ < 900) await sleepMs(1000);
+                const ctx = getCtx(); const msg = (ctx.chat || [])[job.id];
+                if (!msg || (msg.swipe_id || 0) !== job.swipe) { _regenQ.shift(); continue; }
+                job.state = 'run'; _queueSig = ''; renderQueue();
+                const ok = setTagSrcAt(msg, job.k, '[IMG:GEN]');
+                dbg('regen-start', { id: job.id, k: job.k, ok });
+                if (!ok) { _regenQ.shift(); toastr && toastr.warning('Не нашёл этот кадр в сообщении', 'Визуальная новелла'); continue; }
+                try { ctx.updateMessageBlock && ctx.updateMessageBlock(job.id, msg); } catch (e) { /* ignore */ }
+                try { ctx.saveChat && ctx.saveChat(); } catch (e) { /* ignore */ }
+                retriggerImageExtension(job.id, { noButton: true });
+                const t0 = Date.now(); let lastKick = t0, kicks = 0;
+                await sleepMs(2500);
+                for (;;) {
+                    const m2 = (getCtx().chat || [])[job.id];
+                    if (!m2 || (m2.swipe_id || 0) !== job.swipe || _regenQ.indexOf(job) === -1) break;
+                    prepForImageExt(m2);
+                    const st = tagStateAt(m2, job.k);
+                    if (st === 'url' || st === 'err') { dbg('regen-done', { id: job.id, k: job.k, st }); break; }
+                    if (Date.now() - t0 > SEQ_FRAME_TIMEOUT_MS) { dbg('regen-timeout', { id: job.id, k: job.k }); break; }
+                    // расширение картинок пропускает событие, пока занято этим сообщением — «пинаем» раз в ~20 с
+                    if (st === 'gen' && kicks < 8 && Date.now() - lastKick > 20000) { kicks++; lastKick = Date.now(); dbg('regen-kick', { k: job.k, kicks }); retriggerImageExtension(job.id, { noButton: true }); }
+                    await sleepMs(1500);
+                }
+                const ix = _regenQ.indexOf(job); if (ix !== -1) _regenQ.splice(ix, 1);
+                scheduleCardRefresh(job.id); _queueSig = ''; renderQueue();
+            }
+        } catch (e) { dbg('regen-error', String(e && e.message || e)); }
+        finally { _regenBusy = false; }
+    }
+    const Q_LABEL = { ready: ['готов', 'fa-circle-check'], gen: ['генерируется…', 'fa-spinner fa-spin'], wait: ['ждёт очереди', 'fa-hourglass-half'], err: ['не вышел', 'fa-triangle-exclamation'] };
+    function renderQueue() {
+        const ov = player.el; if (!ov) return;
+        const sheet = ov.querySelector('#svn-queue'); if (!sheet || !sheet.classList.contains('svn-show')) return;
+        const items = collectQueue(player.mesId);
+        const sig = JSON.stringify(items.map(x => [x.i, x.state, x.job, x.current, x.url, x.prompt.length])) + '|' + _regenQ.length;
+        if (sig === _queueSig) return; _queueSig = sig;
+        const cnt = { ready: 0, gen: 0, wait: 0, err: 0 };
+        items.forEach(x => { cnt[x.state] = (cnt[x.state] || 0) + 1; });
+        const sum = sheet.querySelector('#svn-queue-sum');
+        if (sum) sum.textContent = items.length ? `Готово ${cnt.ready} из ${items.length} · генерируется ${cnt.gen} · ждут ${cnt.wait} · не вышло ${cnt.err}` : '';
+        const list = sheet.querySelector('#svn-queue-list');
+        list.innerHTML = items.length ? items.map(x => {
+            const lab = Q_LABEL[x.state] || Q_LABEL.gen;
+            let txt = lab[0];
+            if (x.job === 'run') txt = 'перегенерируется…'; else if (x.job === 'wait') txt = 'ждёт повтора';
+            else if (x.state === 'gen' && !x.current) txt = 'запущен';
+            const thumb = x.url ? ` style="background-image:url('${cssUrl(x.url)}')"` : '';
+            const busy = !!x.job;
+            return `<div class="svn-q-item${x.current || x.job === 'run' ? ' svn-q-cur' : ''}" data-slot="${x.i}">
+  <div class="svn-q-thumb"${thumb}>${x.url ? '' : `<i class="fa-solid ${lab[1]}"></i>`}</div>
+  <div class="svn-q-main"><div class="svn-q-top"><b>Кадр ${x.i + 1}</b><span class="svn-q-st svn-q-st-${x.state}"><i class="fa-solid ${lab[1]}"></i> ${escapeHtml(txt)}</span></div><div class="svn-q-prompt">${escapeHtml(x.prompt.slice(0, 220))}</div></div>
+  <div class="svn-q-btns">
+    ${x.job === 'wait' ? `<button class="svn-set-btn" data-q="cancel" data-slot="${x.i}" title="Убрать из очереди повторов"><i class="fa-solid fa-ban"></i> Отмена</button>` : `<button class="svn-set-btn" data-q="regen" data-slot="${x.i}"${busy ? ' disabled' : ''} title="Отправить этот кадр на генерацию заново"><i class="fa-solid fa-rotate-right"></i> Заново</button>`}
+    <button class="svn-set-btn" data-q="goto" data-slot="${x.i}" title="Перейти к этому кадру"><i class="fa-solid fa-eye"></i> Показать</button>
+  </div>
+</div>`;
+        }).join('') : '<div class="svn-bgm-empty">В этом ответе нет кадров-картинок.</div>';
+    }
+    function openQueue() {
+        const ov = player.el; if (!ov) return; const sheet = ov.querySelector('#svn-queue'); if (!sheet) return;
+        closeGallery();
+        ov.querySelector('#svn-settings').classList.remove('svn-show'); ov.querySelector('#svn-cast-panel').classList.remove('svn-show');
+        sheet.classList.add('svn-show'); _queueSig = '';
+        renderQueue();
+        clearInterval(_queueTimer); _queueTimer = setInterval(renderQueue, 1200);
+    }
+    function closeQueue() {
+        clearInterval(_queueTimer); _queueTimer = null;
+        const sheet = player.el && player.el.querySelector('#svn-queue'); if (sheet) sheet.classList.remove('svn-show');
+    }
+    function toggleQueue() { const s = player.el && player.el.querySelector('#svn-queue'); if (!s) return; if (s.classList.contains('svn-show')) closeQueue(); else openQueue(); }
+    function queueJump(slot) {
+        closeQueue();
+        if (!player.scene) return;
+        let fi = player.scene.frames.findIndex(f => f.imageIndex === slot); if (fi < 0) fi = 0;
+        player.frame = fi; renderFrame();
+    }
+
     function toggleGallery() { const s = player.el && player.el.querySelector('#svn-gallery'); if (!s) return; if (s.classList.contains('svn-show')) closeGallery(); else openGallery(); }
     function galleryJump(mesId, slot) {
         closeGallery();
@@ -4901,9 +5632,31 @@ ${prose}
         }
         if (E.MESSAGE_RECEIVED) ctx.eventSource.on(E.MESSAGE_RECEIVED, (id) => { enforceImageDefaults(id); seqHoldOnReceive(id); });
         if (E.CHARACTER_MESSAGE_RENDERED) ctx.eventSource.on(E.CHARACTER_MESSAGE_RENDERED, onCharMessageRendered);
+        // Отдельный лёгкий обработчик «починки пробелов в путях» — в самое НАЧАЛО очереди события. makeLast/makeFirst в таверне ставят
+        // обработчик на место один раз, поэтому наш .on() выше может оказаться ПОСЛЕ расширения картинок (зависит от порядка загрузки).
+        // Этот — всегда перед ним: расширение картинок читает пути уже без пробелов и не перегенерирует готовые кадры.
+        if (E.CHARACTER_MESSAGE_RENDERED) {
+            const es = ctx.eventSource;
+            const spaceFix = (id) => {
+                try {
+                    const m0 = (getCtx().chat || [])[id];
+                    if (m0 && !m0.is_user && getSettings().fixSpacedPaths !== false && prepForImageExt(m0)) {
+                        dbg('fix-spaces', { id, why: 'перед проходом расширения картинок' });
+                        try { getCtx().saveChat && getCtx().saveChat(); } catch (e) { /* ignore */ }
+                    }
+                } catch (e) { /* ignore */ }
+            };
+            (typeof es.makeFirst === 'function' ? es.makeFirst : es.on).call(es, E.CHARACTER_MESSAGE_RENDERED, spaceFix);
+        }
         if (E.STREAM_TOKEN_RECEIVED) ctx.eventSource.on(E.STREAM_TOKEN_RECEIVED, onStreamToken);
         for (const name of ['GENERATION_ENDED', 'GENERATION_STOPPED']) { const ev = E[name]; if (ev) ctx.eventSource.on(ev, onGenDone); }
-        if (E.MESSAGE_UPDATED) ctx.eventSource.on(E.MESSAGE_UPDATED, (id) => setTimeout(() => decorateMessage(id), 80));
+        if (E.MESSAGE_UPDATED) ctx.eventSource.on(E.MESSAGE_UPDATED, (id, info) => {
+            setTimeout(() => decorateMessage(id), 80);
+            // ExtBlocks → «Повторная генерация» блока: он СНАЧАЛА стирает весь extra.extblocks (вместе с кадрами режиссёра),
+            // потом пишет свой блок (1 промпт) и шлёт это событие. Заново ставим кадры до «от…до».
+            if (info && info.source === 'ExtBlocks') dbg('msg-updated', { id, info });
+            if (info && info.source === 'ExtBlocks' && info.reason === 'regenerate') { try { onExtBlocksRegenerated(id); } catch (e) { console.warn('[VN] regen top-up', e); } }
+        });
         if (E.MESSAGE_SWIPED) ctx.eventSource.on(E.MESSAGE_SWIPED, (id) => setTimeout(() => {
             decorateMessage(id);
             if (player.open && player.mesId === id && isVnMessage(id)) openPlayer(id);
@@ -4920,6 +5673,11 @@ ${prose}
             obs.observe(chatEl, { childList: true, subtree: false });
         }
         window.sillyVN = { open: openPlayer, close: closePlayer, parseScene, openBgPicker, openCastManager: () => openCastManager(true), openSettings: openSettingsPanel, isReady: () => true };
+        try { ctx.eventSource.on('/extblocks/generated', (d) => { try { const b = String((d && d.blocks) || ''); dbg('extb-generated', { messageId: d && d.messageId, len: b.length, imgTags: (b.match(/<img\b/gi) || []).length, head: b.slice(0, 120) }); } catch (e) { /* ignore */ } }); } catch (e) { /* ignore */ }
+        setTimeout(() => fixSpacedSrcsAll('старт'), 2500);
+        try { if (E.CHAT_CHANGED) ctx.eventSource.on(E.CHAT_CHANGED, () => setTimeout(() => fixSpacedSrcsAll('смена чата'), 1500)); } catch (e) { /* ignore */ }
+        window.sillyVN.debug = dbgText; window.sillyVN.snapshot = dbgSnapshot; window.sillyVN._test = { retrigger: retriggerImageExtension, player, extBlockContext, collectQueue, enqueueRegen, openQueue, tagStateAt, buildOverlay, fixSpacedSrcs, mirrorToDisplayText, prepForImageExt, askViaExtBlocks, extBlocksApiInfo };
+        dbg('init', dbgEnv());
         console.log('[VN] Визуальная новелла — расширение инициализировано');
     }
 

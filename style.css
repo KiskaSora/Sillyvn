@@ -1161,3 +1161,36 @@ body.svn-lock { overflow: hidden !important; }
     background: #0d0d10 center/cover no-repeat; display: flex; align-items: center; justify-content: center; color: rgba(255, 255, 255, 0.3); font-size: 18px;
 }
 .svn-bg-up-btns { display: flex; flex-direction: column; gap: 5px; flex: 1; }
+
+/* ── Очередь кадров (лист в плеере) ───────────────────────────────── */
+#svn-queue > * { max-width: 720px; }
+.svn-q-tools { display: flex; flex-wrap: wrap; gap: 8px; }
+.svn-q-sum { font-size: 12.5px; color: rgba(255, 255, 255, 0.6); }
+.svn-queue-list { display: flex; flex-direction: column; gap: 8px; }
+.svn-q-item {
+    display: grid; grid-template-columns: 112px 1fr auto; gap: 10px; align-items: center; padding: 8px;
+    border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.12); background: rgba(255, 255, 255, 0.04);
+}
+.svn-q-item.svn-q-cur { border-color: var(--svn-accent, #78aaff); }
+.svn-q-thumb {
+    aspect-ratio: 16 / 9; border-radius: 8px; background: #222 center / cover no-repeat;
+    display: flex; align-items: center; justify-content: center; color: rgba(255, 255, 255, 0.6); font-size: 18px;
+}
+.svn-q-main { min-width: 0; }
+.svn-q-top { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 13px; color: #fff; }
+.svn-q-st { font-size: 12px; display: inline-flex; align-items: center; gap: 5px; }
+.svn-q-st-ready { color: #7bd88f; }
+.svn-q-st-gen { color: var(--svn-accent, #78aaff); }
+.svn-q-st-wait { color: #d9c07a; }
+.svn-q-st-err { color: #ff8a8a; }
+.svn-q-prompt {
+    margin-top: 3px; font-size: 11.5px; line-height: 1.35; color: rgba(255, 255, 255, 0.6);
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere;
+}
+.svn-q-btns { display: flex; flex-direction: column; gap: 6px; }
+.svn-q-btns .svn-set-btn[disabled] { opacity: 0.45; cursor: default; }
+@media (max-width: 600px) {
+    .svn-q-item { grid-template-columns: 84px 1fr; }
+    .svn-q-btns { grid-column: 1 / -1; flex-direction: row; }
+    .svn-q-btns .svn-set-btn { flex: 1 1 0; }
+}
